@@ -36,20 +36,37 @@
       isSelectedParent ? 'selected-parent' : '',
       postHocAffected?.hidden ? 'post-hoc-hidden' : '',
       postHocAffected?.edited ? 'post-hoc-edited' : '',
-      (isHovered || touchActionsOpen) ? 'action-bar-visible' : ''
+      (isHovered || touchActionsOpen) ? 'action-bar-visible' : '',
+      isHumanWrittenAI ? 'human-written-ai' : ''
     ]"
     :style="{
       borderLeft: isSelectedParent ? '3px solid rgb(var(--v-theme-info))' : undefined,
-      padding: '12px 12px 8px 12px'
+      position: 'relative'
     }"
     @mouseenter="isHovered = true"
     @mouseleave="handleMouseLeave"
   >
+    <!-- Authenticity Icon - positioned top right -->
+    <div v-if="authenticityLevel" class="authenticity-corner-wrapper">
+      <AuthenticityIcon 
+        :level="authenticityLevel" 
+        :size="14"
+      />
+    </div>
+    
     <!-- Action bar - appears on hover (desktop) or tap (mobile), positioned at bottom -->
     <div 
       v-if="(isHovered || moreMenuOpen || touchActionsOpen) && !isEditing && !isStreaming" 
       class="action-bar"
     >
+      <!-- Branch navigation (if multiple siblings) -->
+      <template v-if="hasNavigableBranches">
+        <v-btn icon="mdi-chevron-left" size="x-small" variant="text" density="compact" :disabled="siblingIndex === 0" @click="navigateBranch(-1)" />
+        <span class="text-caption meta-text branch-counter">{{ siblingIndex + 1 }}/{{ siblingBranches.length }}</span>
+        <v-btn icon="mdi-chevron-right" size="x-small" variant="text" density="compact" :disabled="siblingIndex === siblingBranches.length - 1" @click="navigateBranch(1)" />
+        <v-divider vertical class="mx-1" style="height: 16px; opacity: 0.3;" />
+      </template>
+      
       <!-- Primary actions -->
       <span v-if="message.branches[branchIndex].role === 'assistant'" class="hover-tooltip" data-tooltip="Regenerate">
         <v-btn
@@ -157,9 +174,15 @@
             </template>
             <v-list-item-title class="text-caption">Download JSON</v-list-item-title>
           </v-list-item>
+          <v-list-item density="compact" @click="copyMessageLink">
+            <template v-slot:prepend>
+              <v-icon size="16" icon="mdi-link" />
+            </template>
+            <v-list-item-title class="text-caption">Copy link</v-list-item-title>
+          </v-list-item>
           <v-divider v-if="(message.branches[branchIndex].role === 'assistant' && (currentBranch.debugRequest || currentBranch.debugResponse)) || canViewMetadata" class="my-0" />
           <v-list-item
-            v-if="message.branches[branchIndex].role === 'assistant' && (currentBranch.debugRequest || currentBranch.debugResponse)"
+            v-if="message.branches[branchIndex].role === 'assistant' && (currentBranch.debugRequest || currentBranch.debugResponse || currentBranch.debugRequestBlobId || currentBranch.debugResponseBlobId)"
             density="compact"
             @click="showDebugDialog = true"
           >
@@ -203,11 +226,19 @@
             </v-list-item>
           </template>
           <v-divider class="my-0" />
-          <v-list-item density="compact" @click="$emit('delete', message.id, currentBranch.id)">
+          <v-list-item density="compact" @click="$emit('fork', message.id, currentBranch.id)">
             <template v-slot:prepend>
-              <v-icon size="16" icon="mdi-delete-outline" color="error" />
+              <v-icon size="16" icon="mdi-source-fork" />
             </template>
-            <v-list-item-title class="text-caption">Delete branch</v-list-item-title>
+            <v-list-item-title class="text-caption">Fork to new chat</v-list-item-title>
+          </v-list-item>
+          <v-list-item density="compact" @click="toggleBranchPrivacy">
+            <template v-slot:prepend>
+              <v-icon size="16" :icon="isPrivateBranch ? 'mdi-eye' : 'mdi-eye-off'" />
+            </template>
+            <v-list-item-title class="text-caption">
+              {{ isPrivateBranch ? 'Make visible to all' : 'Make private (only me)' }}
+            </v-list-item-title>
           </v-list-item>
           <v-list-item v-if="message.branches.length > 1" density="compact" @click="$emit('delete-all-branches', message.id)">
             <template v-slot:prepend>
@@ -258,10 +289,15 @@
           :color="participantColor"
           size="small"
         />
-        <span v-if="participantDisplayName" class="message-name font-weight-medium" :style="participantColor ? `color: ${participantColor};` : ''">
+        <!-- Show participant name: colored/bold for real names, gray for (continue) -->
+        <span v-if="participantDisplayName && participantDisplayName !== '(continue)'" class="message-name font-weight-medium" :style="participantColor ? `color: ${participantColor};` : ''">
           {{ participantDisplayName }}
         </span>
-        <span v-if="senderDisplayName && senderDisplayName !== participantDisplayName" class="text-caption meta-text">
+        <span v-else-if="participantDisplayName === '(continue)'" class="text-caption meta-text">
+          (continue)
+        </span>
+        <!-- Only show sender attribution for user messages (not AI) since sentByUserId on AI means "triggered by" not "authored by" -->
+        <span v-if="currentBranch.role === 'user' && senderDisplayName && senderDisplayName !== participantDisplayName" class="text-caption meta-text">
           ({{ senderDisplayName }})
         </span>
         <span v-if="modelIndicator" class="text-caption meta-text">
@@ -270,7 +306,26 @@
         <span v-if="currentBranch?.createdAt" class="text-caption meta-text">
           {{ formatTimestamp(currentBranch.createdAt) }}
         </span>
+        
+        
+        <!-- Human-written AI plaque -->
+        <v-chip 
+          v-if="isHumanWrittenAI" 
+          size="x-small" 
+          color="pink" 
+          variant="tonal" 
+          density="compact"
+          class="ml-1"
+        >
+          <v-icon size="x-small" start>mdi-account-edit</v-icon>
+          Human-written
+        </v-chip>
+        
         <!-- Badges -->
+        <v-chip v-if="isPrivateBranch" size="x-small" color="deep-purple" variant="tonal" density="compact" class="mr-1">
+          <v-icon size="x-small" start>mdi-incognito</v-icon>
+          Private
+        </v-chip>
         <v-chip v-if="currentBranch?.hiddenFromAi" size="x-small" color="warning" variant="tonal" density="compact">
           <v-icon size="x-small" start>mdi-eye-off</v-icon>
           Hidden
@@ -314,6 +369,49 @@
           <v-icon size="x-small" start>mdi-bookmark</v-icon>
           {{ bookmarkLabel }}
         </v-chip>
+        
+        <!-- Prefix History Indicator (for forked conversations with compressed history) -->
+        <v-menu v-if="hasPrefixHistory" location="bottom" :close-on-content-click="false">
+          <template v-slot:activator="{ props }">
+            <v-chip 
+              v-bind="props" 
+              size="x-small" 
+              color="deep-purple" 
+              variant="tonal" 
+              density="compact" 
+              style="cursor: pointer;"
+            >
+              <v-icon size="x-small" start>mdi-archive-arrow-down</v-icon>
+              {{ prefixHistoryCount }} prior {{ prefixHistoryCount === 1 ? 'message' : 'messages' }}
+              <v-icon size="x-small" end>mdi-chevron-down</v-icon>
+            </v-chip>
+          </template>
+          <v-card max-width="500" class="prefix-history-card">
+            <v-card-title class="text-caption py-2">
+              <v-icon size="small" class="mr-1">mdi-archive</v-icon>
+              Compressed History ({{ prefixHistoryCount }} messages)
+            </v-card-title>
+            <v-divider />
+            <v-card-text class="pa-2" style="max-height: 400px; overflow-y: auto;">
+              <div 
+                v-for="(entry, index) in currentBranch.prefixHistory" 
+                :key="index"
+                class="prefix-history-entry mb-2 pa-2 rounded"
+                :class="entry.role === 'assistant' ? 'bg-grey-darken-3' : 'bg-grey-darken-4'"
+              >
+                <div class="d-flex align-center gap-2 mb-1">
+                  <v-chip size="x-small" :color="entry.role === 'assistant' ? 'primary' : entry.role === 'user' ? 'success' : 'grey'" variant="flat">
+                    {{ entry.participantName || entry.role }}
+                  </v-chip>
+                  <span v-if="entry.model" class="text-caption text-grey">{{ entry.model }}</span>
+                </div>
+                <div class="text-body-2" style="white-space: pre-wrap; word-break: break-word;">
+                  {{ truncateText(entry.content, 500) }}
+                </div>
+              </div>
+            </v-card-text>
+          </v-card>
+        </v-menu>
       </div>
       
       <!-- Center: Branch navigation (desktop only) -->
@@ -363,8 +461,12 @@
       </div>
       
       <!-- Message content or edit mode -->
-      <div v-if="!isEditing" :class="['message-content', { 'monospace-mode': isMonospace }]" v-html="renderedContent" />
-      
+      <div 
+        v-if="!isEditing" 
+        :class="['message-content', { 'monospace-mode': isMonospace }]" 
+        v-html="renderedContent"
+        @contextmenu="handleContentContextMenu"
+      />
       <v-textarea
         v-else
         v-model="editContent"
@@ -375,14 +477,35 @@
         class="mb-2"
       />
       
+      <!-- Context menu for split - teleported to body to avoid transform issues -->
+      <Teleport to="body">
+        <div 
+          v-if="showSplitContextMenu" 
+          class="split-context-menu"
+          :style="{ left: splitMenuPosition.x + 'px', top: splitMenuPosition.y + 'px' }"
+        >
+          <v-card elevation="8" class="pa-0">
+            <v-list density="compact" class="pa-0">
+              <v-list-item @click="splitAtContextPosition" density="compact">
+                <template v-slot:prepend>
+                  <v-icon size="16" icon="mdi-content-cut" />
+                </template>
+                <v-list-item-title class="text-caption">Split here</v-list-item-title>
+              </v-list-item>
+            </v-list>
+          </v-card>
+        </div>
+      </Teleport>
+      
       <!-- Generated images (from model output) -->
       <div v-if="imageBlocks.length > 0" class="generated-images mt-3">
         <div v-for="(block, index) in imageBlocks" :key="'img-' + index" class="generated-image-container mb-2">
           <img 
-            :src="`data:${(block as any).mimeType || 'image/png'};base64,${(block as any).data}`"
+            :src="getImageBlockSrc(block)"
             :alt="(block as any).revisedPrompt || 'Generated image'"
             class="generated-image"
             style="max-width: 100%; max-height: 600px; border-radius: 8px; cursor: pointer;"
+            loading="lazy"
             @click="openImagePreview(block)"
           />
           <div v-if="(block as any).revisedPrompt" class="text-caption text-grey mt-1">
@@ -391,17 +514,43 @@
         </div>
       </div>
       
+      <!-- Display-only stop-reason notices (refusal / max_tokens / pause_turn).
+           These live in contentBlocks as type 'notice' and are never sent to models. -->
+      <v-alert
+        v-for="(block, index) in noticeBlocks"
+        :key="'notice-' + index"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mt-2 text-caption notice-block"
+      >
+        {{ (block as any).text }}
+      </v-alert>
+
       <!-- Attachments display (for user messages) -->
-      <div v-if="currentBranch.role === 'user' && currentBranch.attachments && currentBranch.attachments.length > 0" class="mt-2">
-        <template v-for="attachment in currentBranch.attachments" :key="attachment.id">
+      <div v-if="currentBranch.role === 'user' && displayedAttachments.length > 0" class="mt-2">
+        <template v-for="(attachment, index) in displayedAttachments" :key="attachment.id || `${attachment.fileName}-${index}`">
           <!-- Image attachments -->
           <div v-if="isImageAttachment(attachment)" class="mb-2">
-            <img 
-              :src="getImageSrc(attachment)"
-              :alt="attachment.fileName"
-              style="max-width: 300px; max-height: 300px; border-radius: 8px; cursor: pointer;"
-              @click="openImageInNewTab(attachment)"
-            />
+            <div class="attachment-image-wrapper">
+              <img 
+                :src="getImageSrc(attachment)"
+                :alt="attachment.fileName"
+                style="max-width: 300px; max-height: 300px; border-radius: 8px; cursor: pointer;"
+                @click="openImageInNewTab(attachment)"
+              />
+              <v-btn
+                v-if="canEditAttachments"
+                icon="mdi-close"
+                size="x-small"
+                color="error"
+                variant="flat"
+                density="compact"
+                class="attachment-remove-btn"
+                title="Remove attachment"
+                @click.stop="removeEditAttachment(index)"
+              />
+            </div>
             <div class="text-caption mt-1">{{ attachment.fileName }} ({{ formatFileSize(attachment.fileSize || 0) }})</div>
           </div>
           <!-- Text attachments -->
@@ -410,12 +559,34 @@
             class="mr-2 mb-1"
             size="small"
             color="grey-lighten-2"
+            :closable="canEditAttachments"
+            @click:close="removeEditAttachment(index)"
           >
             <v-icon start size="x-small">mdi-paperclip</v-icon>
             {{ attachment.fileName }}
             <span class="ml-1 text-caption">({{ formatFileSize(attachment.fileSize || 0) }})</span>
           </v-chip>
         </template>
+      </div>
+
+      <div v-if="canEditAttachments" class="mt-2">
+        <input
+          ref="editFileInput"
+          type="file"
+          :accept="EDIT_ATTACHMENT_ACCEPT"
+          multiple
+          style="display: none"
+          @change="handleEditAttachmentSelect"
+        />
+        <v-btn
+          size="small"
+          variant="text"
+          color="primary"
+          prepend-icon="mdi-paperclip-plus"
+          @click="triggerEditAttachmentInput"
+        >
+          Add attachment
+        </v-btn>
       </div>
       
       <div v-if="isEditing" class="d-flex gap-2 mt-2">
@@ -425,6 +596,14 @@
           @click="saveEdit"
         >
           {{ isPostHocEditing ? 'Save for AI' : 'Save & Regenerate' }}
+        </v-btn>
+        <v-btn
+          v-if="!isPostHocEditing"
+          size="small"
+          variant="outlined"
+          @click="saveEditOnly"
+        >
+          Save
         </v-btn>
         <v-btn
           size="small"
@@ -450,7 +629,7 @@
           </div>
         </div>
       </div>
-      <div v-else-if="isStreaming && currentBranch.role === 'assistant'" class="generating-indicator mt-1">
+      <div v-else-if="isStreaming && currentBranch.role === 'assistant'" class="generating-indicator mt-1 d-flex align-center gap-2">
         <v-chip 
           size="x-small" 
           :color="participantColor || 'grey'"
@@ -465,6 +644,16 @@
           />
           Generating...
         </v-chip>
+        <v-btn
+          v-if="showStuckButton"
+          size="x-small"
+          color="warning"
+          variant="tonal"
+          @click="emit('stuck-clicked')"
+        >
+          <v-icon start size="14">mdi-help-circle</v-icon>
+          Stuck?
+        </v-btn>
       </div>
 
     <!-- Bookmark dialog -->
@@ -523,9 +712,11 @@
     <!-- Debug Dialog -->
     <DebugMessageDialog
       v-model="showDebugDialog"
-      :debug-request="currentBranch.debugRequest"
-      :debug-response="currentBranch.debugResponse"
+      :conversation-id="message.conversationId"
+      :message-id="message.id"
+      :branch-id="currentBranch.id"
     />
+    
     
     <!-- Metadata Dialog (for researchers/admins) -->
     <v-dialog v-model="showMetadataDialog" max-width="800">
@@ -618,11 +809,11 @@
                 </tr>
                 <tr>
                   <td class="font-weight-medium">Has Debug Request</td>
-                  <td>{{ !!currentBranch.debugRequest }}</td>
+                  <td>{{ !!(currentBranch.debugRequest || currentBranch.debugRequestBlobId) }}</td>
                 </tr>
                 <tr>
                   <td class="font-weight-medium">Has Debug Response</td>
-                  <td>{{ !!currentBranch.debugResponse }}</td>
+                  <td>{{ !!(currentBranch.debugResponse || currentBranch.debugResponseBlobId) }}</td>
                 </tr>
                 <tr>
                   <td class="font-weight-medium">Created At</td>
@@ -678,14 +869,20 @@
             </v-expansion-panels>
           </div>
           
-          <div v-if="currentBranch.debugRequest" class="mb-4">
+          <div v-if="currentBranch.debugRequest || currentBranch.debugRequestBlobId" class="mb-4">
             <h4 class="text-subtitle-1 mb-2">Debug Request</h4>
-            <pre class="debug-json pa-2 rounded" style="max-height: 300px; overflow: auto; font-size: 11px;">{{ JSON.stringify(currentBranch.debugRequest, null, 2) }}</pre>
+            <p v-if="currentBranch.debugRequestBlobId && !currentBranch.debugRequest" class="text-caption text-grey">
+              Debug data stored as blob. Open debug panel to load.
+            </p>
+            <pre v-else class="debug-json pa-2 rounded" style="max-height: 300px; overflow: auto; font-size: 11px;">{{ JSON.stringify(currentBranch.debugRequest, null, 2) }}</pre>
           </div>
           
-          <div v-if="currentBranch.debugResponse" class="mb-4">
+          <div v-if="currentBranch.debugResponse || currentBranch.debugResponseBlobId" class="mb-4">
             <h4 class="text-subtitle-1 mb-2">Debug Response</h4>
-            <pre class="debug-json pa-2 rounded" style="max-height: 200px; overflow: auto; font-size: 11px;">{{ JSON.stringify(currentBranch.debugResponse, null, 2) }}</pre>
+            <p v-if="currentBranch.debugResponseBlobId && !currentBranch.debugResponse" class="text-caption text-grey">
+              Debug data stored as blob. Open debug panel to load.
+            </p>
+            <pre v-else class="debug-json pa-2 rounded" style="max-height: 200px; overflow: auto; font-size: 11px;">{{ JSON.stringify(currentBranch.debugResponse, null, 2) }}</pre>
           </div>
         </v-card-text>
         <v-card-actions>
@@ -707,7 +904,14 @@
     <v-dialog v-model="showAvatarPreview" max-width="400">
       <v-card>
         <v-card-title class="d-flex align-center">
-          <span>{{ participantDisplayName }}</span>
+          <div>
+            <div :style="participantColor ? `color: ${participantColor};` : ''">
+              {{ avatarPreviewName }}
+            </div>
+            <div v-if="avatarPreviewModelId" class="text-caption text-grey" style="font-family: monospace;">
+              {{ avatarPreviewModelId }}
+            </div>
+          </div>
           <v-spacer />
           <v-btn icon="mdi-close" variant="text" size="small" @click="showAvatarPreview = false" />
         </v-card-title>
@@ -725,19 +929,24 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUpdated, watch } from 'vue';
+import { ref, computed, onMounted, onUnmounted, onUpdated, watch } from 'vue';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
-import type { Message, Participant } from '@deprecated-claude/shared';
+import type { Attachment, Message, Participant } from '@deprecated-claude/shared';
 import { getModelColor } from '@/utils/modelColors';
-import { renderLatex, KATEX_ALLOWED_TAGS, KATEX_ALLOWED_ATTRS } from '@/utils/latex';
+import { extractMath, restoreMath, KATEX_ALLOWED_TAGS, KATEX_ALLOWED_ATTRS } from '@/utils/latex';
+import '@/utils/dompurify-hooks'; // side-effect: hardens img tags via DOMPurify hook
 import { api } from '@/services/api';
 import { useStore } from '@/store';
 import { getParticipantAvatarUrl, getAvatarColor, loadAvatarPacks } from '@/utils/avatars';
 import DebugMessageDialog from './DebugMessageDialog.vue';
+import AuthenticityIcon from './AuthenticityIcon.vue';
+import { getAuthenticityLevel } from '@/utils/authenticity';
 import 'katex/dist/katex.min.css'; // KaTeX styles
 
 const store = useStore();
+
+import type { AuthenticityStatus as AuthStatus } from '@/utils/authenticity';
 
 const props = defineProps<{
   message: Message;
@@ -749,16 +958,20 @@ const props = defineProps<{
   errorMessage?: string;
   errorSuggestion?: string;
   postHocAffected?: { hidden: boolean; edited: boolean; editedContent?: string; originalContent?: string; hiddenAttachments: number[] };
+  showStuckButton?: boolean;
+  authenticityStatus?: AuthStatus;
 }>();
 
 const emit = defineEmits<{
   regenerate: [messageId: string, branchId: string];
-  edit: [messageId: string, branchId: string, content: string];
+  edit: [messageId: string, branchId: string, content: string, attachments?: EditableAttachment[]];
+  'edit-only': [messageId: string, branchId: string, content: string, attachments?: EditableAttachment[]];  // Edit and branch without regeneration
   'switch-branch': [messageId: string, branchId: string];
   delete: [messageId: string, branchId: string];
   'delete-all-branches': [messageId: string];
   'select-as-parent': [messageId: string, branchId: string];
   'stop-auto-scroll': [];
+  'stuck-clicked': [];
   'bookmark-changed': [];
   'post-hoc-hide': [messageId: string, branchId: string];
   'post-hoc-edit': [messageId: string, branchId: string];
@@ -766,11 +979,17 @@ const emit = defineEmits<{
   'post-hoc-hide-before': [messageId: string, branchId: string];
   'post-hoc-unhide': [messageId: string, branchId: string];
   'delete-post-hoc-operation': [messageId: string];
+  'split': [messageId: string, branchId: string, splitPosition: number];
+  'fork': [messageId: string, branchId: string];
 }>();
 
 const isEditing = ref(false);
 const isPostHocEditing = ref(false); // True when editing for post-hoc operation (no regeneration)
 const editContent = ref('');
+type EditableAttachment = Pick<Attachment, 'fileName' | 'fileType' | 'content'> & Partial<Pick<Attachment, 'id' | 'fileSize' | 'mimeType' | 'encoding'>>;
+const editAttachments = ref<EditableAttachment[]>([]);
+const editAttachmentsDirty = ref(false);
+const editFileInput = ref<HTMLInputElement | null>(null);
 const messageCard = ref<HTMLElement>();
 const showScrollToTop = ref(false);
 const isHovered = ref(false);
@@ -778,6 +997,12 @@ const isMonospace = ref(false); // Toggle monospace display for entire message
 const moreMenuOpen = ref(false); // Track more menu state for debugging
 const isTouchDevice = ref(false); // Detect touch devices to disable hover bar
 const touchActionsOpen = ref(false); // Toggle for action bar on touch devices
+const isSplitting = ref(false); // True when in split mode (deprecated - using context menu now)
+const splitPosition = ref(0); // Position to split at (character index)
+const showSplitContextMenu = ref(false); // Context menu visibility
+const splitMenuPosition = ref({ x: 0, y: 0 }); // Position for context menu
+const contextSplitPosition = ref(0); // Position determined from context menu click
+const splitMenuCloseHandler = ref<((e: MouseEvent) => void) | null>(null); // Track close handler for cleanup
 
 // Detect touch device on mount - use multiple detection methods for reliability
 onMounted(() => {
@@ -785,6 +1010,14 @@ onMounted(() => {
     'ontouchstart' in window || 
     navigator.maxTouchPoints > 0 ||
     (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+});
+
+onUnmounted(() => {
+  // Clean up split menu handler
+  if (splitMenuCloseHandler.value) {
+    document.removeEventListener('click', splitMenuCloseHandler.value);
+    document.removeEventListener('contextmenu', splitMenuCloseHandler.value);
+  }
 });
 
 // Toggle action bar on touch devices
@@ -853,6 +1086,14 @@ const currentBranch = computed(() => {
   return branch;
 });
 
+const canEditAttachments = computed(() => currentBranch.value?.role === 'user' && isEditing.value && !isPostHocEditing.value);
+const displayedAttachments = computed(() => {
+  if (canEditAttachments.value) {
+    return editAttachments.value;
+  }
+  return currentBranch.value?.attachments || [];
+});
+
 // Check if this message is a post-hoc operation
 const isPostHocOperation = computed(() => {
   return !!currentBranch.value?.postHocOperation;
@@ -878,12 +1119,28 @@ const postHocOperationIcon = computed(() => {
   }
 });
 
-// Look up model details from store
+// Look up model details from store.
+//
+// Branches in storage sometimes record `branch.model` as the canonical
+// internal `id` (e.g. `claude-3-haiku-bedrock`), and other code paths /
+// older conversations sometimes recorded it as the long `providerModelId`
+// (e.g. `apac.anthropic.claude-3-haiku-20240307-v1:0`). Looking up only
+// by `id` left the long form unresolved — the UI then fell through to
+// displaying the raw provider model ID instead of the friendly shortName,
+// surfaced in PR #100 testing as "Haiku 3 displays as
+// `apac.anthropic.claude-3-haiku-20240307-v1:0`".
+//
+// Fix: match either form. The internal id is the canonical key (preferred
+// when both are present in the same record), and providerModelId is a
+// valid fallback.
 function getModelDetails(modelId: string | undefined) {
   if (!modelId) return null;
-  
+
+  const matchesModelId = (m: { id?: string; providerModelId?: string }) =>
+    m.id === modelId || m.providerModelId === modelId;
+
   // Check standard models
-  const standardModel = store.state.models.find(m => m.id === modelId);
+  const standardModel = store.state.models.find(matchesModelId);
   if (standardModel) {
     return {
       displayName: standardModel.displayName || standardModel.shortName || modelId,
@@ -892,9 +1149,9 @@ function getModelDetails(modelId: string | undefined) {
       isCustom: false
     };
   }
-  
+
   // Check custom models
-  const customModel = store.state.customModels?.find(m => m.id === modelId);
+  const customModel = store.state.customModels?.find(matchesModelId);
   if (customModel) {
     return {
       displayName: customModel.displayName || modelId,
@@ -903,7 +1160,7 @@ function getModelDetails(modelId: string | undefined) {
       isCustom: true
     };
   }
-  
+
   return null;
 }
 
@@ -928,6 +1185,15 @@ const senderDisplayName = computed(() => {
 
 const hasBookmark = computed(() => {
   return bookmarkLabel.value !== null && bookmarkLabel.value !== '';
+});
+
+// Check if message has prefix history (compressed fork history)
+const hasPrefixHistory = computed(() => {
+  return currentBranch.value?.prefixHistory && currentBranch.value.prefixHistory.length > 0;
+});
+
+const prefixHistoryCount = computed(() => {
+  return currentBranch.value?.prefixHistory?.length || 0;
 });
 
 // Check if message is long enough to need scroll button
@@ -976,7 +1242,7 @@ function scrollToTopOfMessage() {
   }
 }
 
-// Get participant display name (shown in UI - empty for empty-name participants)
+// Get participant display name (shown in UI)
 const participantDisplayName = computed(() => {
   const branch = currentBranch.value;
   
@@ -988,8 +1254,9 @@ const participantDisplayName = computed(() => {
   // Find the participant by ID
   const participant = props.participants.find(p => p.id === branch.participantId);
   if (participant && participant.name === '') {
-    // Return empty string for empty-name participants (no name shown)
-    return '';
+    // Empty-name participants are "continuation" participants - their messages
+    // don't have a username header in the log (raw continuations)
+    return '(continue)';
   } else if (participant) {
     return participant.name;
   }
@@ -1014,6 +1281,21 @@ const modelIndicator = computed(() => {
   }
   
   return null;
+});
+
+// Authenticity level for this message
+const authenticityLevel = computed(() => {
+  if (!props.authenticityStatus) return null;
+  return getAuthenticityLevel(props.authenticityStatus);
+});
+
+// Check if this is a human-written AI message (for special styling)
+const isHumanWrittenAI = computed(() => {
+  return props.authenticityStatus?.isHumanWrittenAI ?? false;
+});
+
+const isPrivateBranch = computed(() => {
+  return !!currentBranch.value?.privateToUserId;
 });
 
 const participantColor = computed(() => {
@@ -1073,12 +1355,53 @@ const avatarUrl = computed(() => {
   );
 });
 
+// Name to show in avatar preview (use model name if participant name is single letter like 'A')
+const avatarPreviewName = computed(() => {
+  const name = participantDisplayName.value;
+  // If name is a single letter (placeholder), use model display name instead
+  if (name && name.length === 1) {
+    const branch = currentBranch.value;
+    const modelId = branch.model;
+    if (modelId) {
+      const modelObj = store.state.models?.find((m: any) => m.id === modelId);
+      if (modelObj?.displayName) {
+        return modelObj.displayName;
+      }
+    }
+  }
+  return name || 'Assistant';
+});
+
+// Model ID to always show in avatar preview
+const avatarPreviewModelId = computed(() => {
+  const branch = currentBranch.value;
+  if (branch.role !== 'assistant') return null;
+  
+  const modelId = branch.model;
+  if (!modelId) return null;
+  
+  const modelObj = store.state.models?.find((m: any) => m.id === modelId);
+  // Prefer providerModelId as it's the most useful identifier
+  return modelObj?.providerModelId || modelId;
+});
+
 // Get all sibling branches (branches that share the same parent)
+// FIX: Treat undefined, null, and 'root' as equivalent for root messages
+// This handles inconsistency where createMessage sets 'root' but addMessageBranch uses undefined
 const siblingBranches = computed(() => {
   const activeParent = currentBranch.value.parentBranchId;
-  return props.message.branches.filter(
-    branch => branch.parentBranchId === activeParent
-  );
+  const isActiveRoot = !activeParent || activeParent === 'root';
+  
+  return props.message.branches.filter(branch => {
+    const branchParent = branch.parentBranchId;
+    const isBranchRoot = !branchParent || branchParent === 'root';
+    
+    // If both are root branches, they're siblings
+    if (isActiveRoot && isBranchRoot) return true;
+    
+    // Otherwise, exact match required
+    return branchParent === activeParent;
+  });
 });
 
 // Get index among siblings
@@ -1091,18 +1414,101 @@ const hasNavigableBranches = computed(() => {
   return siblingBranches.value.length > 1;
 });
 
-// Extract thinking blocks from content blocks
+// Some routes (e.g. Anthropic models via OpenRouter when the reasoning
+// signature isn't propagated) emit thinking as literal <thinking>…</thinking>
+// inside delta.content rather than via structured reasoning fields. The right
+// fix is upstream, but in the meantime the UI lifts those tags out of the
+// body and surfaces them in the same thinking toggle as structured blocks.
+// Acts on the rendered branch's content only — stored data is untouched.
+const CLOSED_INLINE_THINKING = /<thinking>([\s\S]*?)<\/thinking>/gi;
+const TRAILING_OPEN_THINKING = /<thinking>([\s\S]*)$/i;
+
+function getMarkdownCodeRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+
+  for (const match of text.matchAll(/```[\s\S]*?```/g)) {
+    const start = match.index ?? 0;
+    ranges.push([start, start + match[0].length]);
+  }
+
+  for (const match of text.matchAll(/`[^`\n]+`/g)) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (!ranges.some(([rangeStart, rangeEnd]) => start >= rangeStart && start < rangeEnd)) {
+      ranges.push([start, end]);
+    }
+  }
+
+  return ranges.sort(([a], [b]) => a - b);
+}
+
+function isInsideRange(index: number, ranges: Array<[number, number]>): boolean {
+  return ranges.some(([start, end]) => index >= start && index < end);
+}
+
+function extractInlineThinking(text: string): { closed: string[]; partial?: string; visibleContent: string; hasInlineThinking: boolean } {
+  if (!text) return { closed: [], visibleContent: '', hasInlineThinking: false };
+  const closed: string[] = [];
+  const ranges = getMarkdownCodeRanges(text);
+  const visibleParts: string[] = [];
+  let lastIndex = 0;
+  let hasInlineThinking = false;
+
+  for (const m of text.matchAll(CLOSED_INLINE_THINKING)) {
+    const start = m.index ?? 0;
+    if (isInsideRange(start, ranges)) continue;
+
+    const t = m[1].trim();
+    if (t) closed.push(t);
+    visibleParts.push(text.slice(lastIndex, start));
+    lastIndex = start + m[0].length;
+    hasInlineThinking = true;
+  }
+
+  visibleParts.push(text.slice(lastIndex));
+
+  // After stripping closed pairs, a dangling open tag means streaming is
+  // mid-thought; surface what's been streamed so far in the panel too.
+  let visibleContent = visibleParts.join('');
+  const dangling = visibleContent.match(TRAILING_OPEN_THINKING);
+  const danglingStart = dangling?.index ?? -1;
+  const visibleRanges = dangling ? getMarkdownCodeRanges(visibleContent) : [];
+  const hasDanglingThinking = dangling && !isInsideRange(danglingStart, visibleRanges);
+  if (hasDanglingThinking) {
+    visibleContent = visibleContent.slice(0, danglingStart);
+    hasInlineThinking = true;
+  }
+  const partial = dangling ? dangling[1].trim() : '';
+
+  return {
+    closed,
+    partial: hasDanglingThinking && partial.length > 0 ? partial : undefined,
+    visibleContent: visibleContent.replace(/\n{3,}/g, '\n\n'),
+    hasInlineThinking
+  };
+}
+
+// Extract thinking blocks from content blocks (and salvage inline tags)
 const thinkingBlocks = computed(() => {
   const branch = currentBranch.value;
-  if (!branch.contentBlocks || branch.contentBlocks.length === 0) {
-    return [];
-  }
-  
-  // Filter for thinking and redacted_thinking blocks
-  return branch.contentBlocks.filter((block: any) => 
+  const structured = (branch?.contentBlocks || []).filter((block: any) =>
     block.type === 'thinking' || block.type === 'redacted_thinking'
   );
+
+  const source = props.postHocAffected?.editedContent ?? branch?.content ?? '';
+  const { closed, partial } = extractInlineThinking(source);
+  const inline = closed.map(t => ({ type: 'thinking' as const, thinking: t }));
+  if (partial) inline.push({ type: 'thinking' as const, thinking: partial });
+
+  return [...structured, ...inline];
 });
+
+// Display-only notice blocks (abnormal stop reasons: refusal / max_tokens /
+// pause_turn). Injected by the backend as type 'notice'; rendered as a
+// warning banner and never sent back to any model.
+const noticeBlocks = computed(() =>
+  (currentBranch.value?.contentBlocks || []).filter((block: any) => block.type === 'notice')
+);
 
 // Extract generated image blocks from content blocks
 const imageBlocks = computed(() => {
@@ -1124,9 +1530,10 @@ const thinkingPanelOpen = ref<number | undefined>(undefined);
 
 // Check if thinking is currently streaming (has thinking blocks, is streaming, no content yet)
 const isThinkingStreaming = computed(() => {
+  const visibleContent = extractInlineThinking(currentBranch.value.content || '').visibleContent.trim();
   const streaming = props.isStreaming && 
          thinkingBlocks.value.length > 0 && 
-         !currentBranch.value.content?.trim();
+         !visibleContent;
   return streaming;
 });
 
@@ -1151,6 +1558,12 @@ watch(isThinkingStreaming, (streaming, oldStreaming) => {
 const renderedContent = computed(() => {
   // Use edited content if this message has a post-hoc edit applied
   let content = props.postHocAffected?.editedContent ?? currentBranch.value.content;
+
+  // Lift inline <thinking>…</thinking> tags out of the displayed body. Their
+  // contents are surfaced separately via the thinking toggle (see
+  // thinkingBlocks). The extractor ignores tags inside Markdown code fences and
+  // inline backtick spans, so examples remain visible as literal code.
+  content = extractInlineThinking(content).visibleContent;
   
   // Preserve leading/trailing whitespace by converting to non-breaking spaces
   const leadingSpaces = content.match(/^(\s+)/)?.[1] || '';
@@ -1173,10 +1586,40 @@ const renderedContent = computed(() => {
     inlineCode.push(match);
     return `__INLINE_CODE_${index}__`;
   });
+
+  // Extract LaTeX math regions BEFORE markdown runs. CommonMark backslash
+  // escapes (\(, \), \[, \]) would otherwise be consumed by marked.parse,
+  // destroying the math delimiters before KaTeX ever sees them. The returned
+  // placeholders are plain alphanumerics, so they survive markdown unchanged.
+  // Code blocks are already placeholdered above, so math inside ``` blocks
+  // is not affected.
+  const { text: contentAfterMath, rendered: renderedMath } = extractMath(content);
+  content = contentAfterMath;
+
+  // Note: we intentionally do NOT escape `<` and `>` here. DOMPurify (run
+  // after marked.parse below) is the security boundary for HTML — it strips
+  // dangerous tags (script, iframe, on* event handlers) and malicious
+  // attributes from the rendered output. Escaping `<>` here additionally
+  // caused model-emitted HTML structure (e.g. raw `<p>` / `</strong>` that
+  // some models produce) to display as literal text rather than render as
+  // intended structure. Per the project ethos: trust DOMPurify, allow models
+  // to format as they intend, don't preemptively defend against the model.
+  // SharedMessageComponent.vue already follows this pattern; this brings
+  // MessageComponent into agreement.
+
+
+  // Preserve multiple consecutive spaces by converting to non-breaking spaces
+  // (do this before markdown rendering, which would collapse them)
+  // Convert 2+ spaces to alternating space/nbsp to preserve them
+  content = content.replace(/ {2,}/g, (match) => {
+    // Alternate between regular space and nbsp to allow wrapping while preserving count
+    return match.split('').map((_, i) => i % 2 === 0 ? ' ' : '&nbsp;').join('');
+  });
   
-  // Escape HTML/XML tags that aren't in code blocks
-  // This prevents raw HTML from being rendered but preserves it visually
-  content = content.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Also preserve leading spaces on each line (for indentation)
+  content = content.replace(/^( +)/gm, (match) => {
+    return match.replace(/ /g, '&nbsp;');
+  });
   
   // Restore code blocks and inline code
   content = content.replace(/__CODE_BLOCK_(\d+)__/g, (_, index) => codeBlocks[parseInt(index)]);
@@ -1208,9 +1651,10 @@ const renderedContent = computed(() => {
   if (html instanceof Promise) {
     html = ''; // Fallback, but this shouldn't happen with sync parse
   }
-  
-  // Render LaTeX after markdown (so LaTeX in code blocks is protected)
-  html = renderLatex(html as string);
+
+  // Substitute rendered KaTeX HTML back in for the math placeholders we
+  // extracted before markdown ran.
+  html = restoreMath(html as string, renderedMath);
   
   // Convert leading/trailing spaces to non-breaking spaces to preserve them
   const leadingNbsp = leadingSpaces.replace(/ /g, '&nbsp;').replace(/\n/g, '<br>');
@@ -1244,35 +1688,340 @@ function escapeHtml(text: string): string {
   return div.innerHTML;
 }
 
+function cloneEditableAttachments(attachments: Attachment[] = []): EditableAttachment[] {
+  return attachments.map(att => ({
+    id: att.id,
+    fileName: att.fileName,
+    fileSize: att.fileSize,
+    fileType: att.fileType,
+    mimeType: att.mimeType,
+    content: att.content,
+    encoding: att.encoding
+  }));
+}
+
+function normalizedAttachmentList(attachments: EditableAttachment[]) {
+  return attachments.map(att => ({
+    id: att.id,
+    fileName: att.fileName,
+    fileSize: att.fileSize,
+    fileType: att.fileType,
+    mimeType: att.mimeType,
+    encoding: att.encoding,
+    content: att.content
+  }));
+}
+
+function attachmentsChanged(): boolean {
+  return JSON.stringify(normalizedAttachmentList(editAttachments.value)) !==
+    JSON.stringify(normalizedAttachmentList(cloneEditableAttachments(currentBranch.value.attachments || [])));
+}
+
+function removeEditAttachment(index: number) {
+  editAttachments.value.splice(index, 1);
+  editAttachmentsDirty.value = true;
+}
+
+const EDIT_ATTACHMENT_ACCEPT = '.txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.java,.cpp,.c,.h,.hpp,.jpg,.jpeg,.png,.gif,.webp,.svg,.pdf,application/pdf,.mp3,.wav,.flac,.ogg,.m4a,.aac,.mp4,.mov,.avi,.mkv,.webm';
+const EDIT_FILE_TYPES = {
+  image: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'],
+  pdf: ['pdf'],
+  audio: ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'webm'],
+  video: ['mp4', 'mov', 'avi', 'mkv', 'webm'],
+};
+const EDIT_TEXT_EXTENSIONS = ['txt', 'md', 'csv', 'json', 'xml', 'html', 'css', 'js', 'ts', 'py', 'java', 'cpp', 'c', 'h', 'hpp'];
+const EDIT_MIME_TYPES: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  pdf: 'application/pdf',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  flac: 'audio/flac',
+  ogg: 'audio/ogg',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  mkv: 'video/x-matroska',
+  webm: 'video/webm',
+};
+
+function triggerEditAttachmentInput() {
+  editFileInput.value?.click();
+}
+
+function getEditFileCategory(extension: string): 'image' | 'pdf' | 'audio' | 'video' | 'text' {
+  if (EDIT_FILE_TYPES.image.includes(extension)) return 'image';
+  if (EDIT_FILE_TYPES.pdf.includes(extension)) return 'pdf';
+  if (EDIT_FILE_TYPES.audio.includes(extension)) return 'audio';
+  if (EDIT_FILE_TYPES.video.includes(extension)) return 'video';
+  return 'text';
+}
+
+function isSupportedEditAttachment(file: File, extension: string): boolean {
+  const supportedExtensions = [
+    ...EDIT_FILE_TYPES.image,
+    ...EDIT_FILE_TYPES.pdf,
+    ...EDIT_FILE_TYPES.audio,
+    ...EDIT_FILE_TYPES.video,
+    ...EDIT_TEXT_EXTENSIONS,
+  ];
+  return supportedExtensions.includes(extension) ||
+    file.type.startsWith('image/') ||
+    file.type.startsWith('audio/') ||
+    file.type.startsWith('video/') ||
+    file.type === 'application/pdf';
+}
+
+function getEditMimeType(extension: string, file: File): string {
+  return file.type || EDIT_MIME_TYPES[extension] || 'application/octet-stream';
+}
+
+async function handleEditAttachmentSelect(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (!input.files) return;
+
+  for (const file of Array.from(input.files)) {
+    const extensionFromName = file.name.split('.').pop()?.toLowerCase() || '';
+    const extensionFromMime = file.type.split('/')[1]?.toLowerCase() || '';
+    const fileExtension = extensionFromName || extensionFromMime || 'txt';
+
+    if (!isSupportedEditAttachment(file, fileExtension)) {
+      console.log(`Unsupported edit attachment type: ${file.name}`);
+      continue;
+    }
+
+    const category = getEditFileCategory(fileExtension);
+    const mimeType = getEditMimeType(fileExtension, file);
+    const isBinary = category !== 'text' || file.type.startsWith('image/') || file.type.startsWith('audio/') || file.type.startsWith('video/') || file.type === 'application/pdf';
+    const content = isBinary ? await readEditFileAsBase64(file) : await readEditFileAsText(file);
+
+    editAttachments.value.push({
+      fileName: file.name || `attachment-${Date.now()}.${fileExtension}`,
+      fileType: fileExtension,
+      mimeType,
+      fileSize: file.size,
+      content,
+      encoding: isBinary ? 'base64' : 'text',
+    });
+    editAttachmentsDirty.value = true;
+  }
+
+  input.value = '';
+}
+
+function readEditFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target?.result as string);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
+
+function readEditFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      resolve(result.split(',')[1] || '');
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 function startEdit() {
   isEditing.value = true;
   isPostHocEditing.value = false;
   editContent.value = currentBranch.value.content;
+  editAttachments.value = cloneEditableAttachments(currentBranch.value.attachments || []);
+  editAttachmentsDirty.value = false;
+}
+
+async function toggleBranchPrivacy() {
+  const branch = currentBranch.value;
+  if (!branch) return;
+  
+  const newPrivacy = branch.privateToUserId ? null : store.state.user?.id;
+  
+  try {
+    await api.post(
+      `/conversations/${props.message.conversationId}/messages/${props.message.id}/branches/${branch.id}/privacy`,
+      { privateToUserId: newPrivacy }
+    );
+    // The WebSocket will broadcast the update
+  } catch (error) {
+    console.error('Failed to toggle branch privacy:', error);
+  }
 }
 
 function startPostHocEdit() {
   isEditing.value = true;
   isPostHocEditing.value = true;
   editContent.value = currentBranch.value.content;
+  editAttachments.value = [];
+  editAttachmentsDirty.value = false;
 }
 
 function cancelEdit() {
   isEditing.value = false;
   isPostHocEditing.value = false;
   editContent.value = '';
+  editAttachments.value = [];
+  editAttachmentsDirty.value = false;
 }
 
 function saveEdit() {
-  if (editContent.value !== currentBranch.value.content) {
+  const contentChanged = editContent.value !== currentBranch.value.content;
+  const attachmentListChanged = !isPostHocEditing.value && (editAttachmentsDirty.value || attachmentsChanged());
+  if (contentChanged || attachmentListChanged) {
     if (isPostHocEditing.value) {
       // Create a post-hoc edit operation (no regeneration)
       emit('post-hoc-edit-content', props.message.id, currentBranch.value.id, editContent.value);
     } else {
       // Regular edit that triggers regeneration
-      emit('edit', props.message.id, currentBranch.value.id, editContent.value);
+      emit('edit', props.message.id, currentBranch.value.id, editContent.value, attachmentListChanged ? editAttachments.value : undefined);
     }
   }
   cancelEdit();
+}
+
+function saveEditOnly() {
+  const contentChanged = editContent.value !== currentBranch.value.content;
+  const attachmentListChanged = !isPostHocEditing.value && (editAttachmentsDirty.value || attachmentsChanged());
+  if (contentChanged || attachmentListChanged) {
+    // Edit and branch without triggering regeneration
+    emit('edit-only', props.message.id, currentBranch.value.id, editContent.value, attachmentListChanged ? editAttachments.value : undefined);
+  }
+  cancelEdit();
+}
+
+function startSplit() {
+  const content = currentBranch.value?.content || '';
+  // Default to middle of message
+  splitPosition.value = Math.floor(content.length / 2);
+  isSplitting.value = true;
+}
+
+function cancelSplit() {
+  isSplitting.value = false;
+  splitPosition.value = 0;
+}
+
+function confirmSplit() {
+  if (splitPosition.value > 0 && splitPosition.value < (currentBranch.value?.content?.length || 0)) {
+    emit('split', props.message.id, currentBranch.value.id, splitPosition.value);
+  }
+  cancelSplit();
+}
+
+function handleContentContextMenu(event: MouseEvent) {
+  // Only show for assistant messages
+  if (currentBranch.value?.role !== 'assistant') return;
+  
+  event.preventDefault();
+  
+  // Get the text selection or caret position
+  const selection = window.getSelection();
+  if (!selection) return;
+  
+  // Get selected text or the word around caret
+  let selectedText = selection.toString();
+  let searchPosition = 0;
+  
+  if (selectedText.length === 0) {
+    // No selection - use the focused text node and offset
+    const range = selection.getRangeAt(0);
+    const node = range.startContainer;
+    
+    if (node.nodeType === Node.TEXT_NODE) {
+      const textContent = node.textContent || '';
+      const offset = range.startOffset;
+      // Get surrounding context (20 chars before)
+      const contextStart = Math.max(0, offset - 20);
+      selectedText = textContent.substring(contextStart, offset);
+    }
+  }
+  
+  // Find this text in the source content
+  const sourceContent = currentBranch.value?.content || '';
+  
+  if (selectedText.length > 0) {
+    // Find the position in source - search for the selected/context text
+    const index = sourceContent.indexOf(selectedText);
+    if (index !== -1) {
+      // Split after this text
+      searchPosition = index + selectedText.length;
+    } else {
+      // Fallback: estimate position based on selection range
+      // Try to find partial match
+      for (let len = selectedText.length; len >= 5; len--) {
+        const partial = selectedText.substring(selectedText.length - len);
+        const idx = sourceContent.indexOf(partial);
+        if (idx !== -1) {
+          searchPosition = idx + partial.length;
+          break;
+        }
+      }
+    }
+  }
+  
+  // Validate position
+  if (searchPosition <= 0 || searchPosition >= sourceContent.length) {
+    // Can't determine valid split position
+    return;
+  }
+  
+  contextSplitPosition.value = searchPosition;
+  // Use clientX/clientY for fixed positioning (viewport-relative)
+  splitMenuPosition.value = { x: event.clientX, y: event.clientY };
+  showSplitContextMenu.value = true;
+  
+  // Clean up any existing handler first
+  if (splitMenuCloseHandler.value) {
+    document.removeEventListener('click', splitMenuCloseHandler.value);
+    document.removeEventListener('contextmenu', splitMenuCloseHandler.value);
+  }
+  
+  // Close menu on click outside or another context menu
+  splitMenuCloseHandler.value = () => {
+    showSplitContextMenu.value = false;
+    if (splitMenuCloseHandler.value) {
+      document.removeEventListener('click', splitMenuCloseHandler.value);
+      document.removeEventListener('contextmenu', splitMenuCloseHandler.value);
+      splitMenuCloseHandler.value = null;
+    }
+  };
+  
+  // Delay adding listener so current event doesn't trigger it
+  setTimeout(() => {
+    if (splitMenuCloseHandler.value) {
+      document.addEventListener('click', splitMenuCloseHandler.value);
+      document.addEventListener('contextmenu', splitMenuCloseHandler.value);
+    }
+  }, 10);
+}
+
+function splitAtContextPosition() {
+  if (contextSplitPosition.value > 0 && contextSplitPosition.value < (currentBranch.value?.content?.length || 0)) {
+    emit('split', props.message.id, currentBranch.value.id, contextSplitPosition.value);
+  }
+  closeSplitMenu();
+}
+
+function closeSplitMenu() {
+  showSplitContextMenu.value = false;
+  if (splitMenuCloseHandler.value) {
+    document.removeEventListener('click', splitMenuCloseHandler.value);
+    document.removeEventListener('contextmenu', splitMenuCloseHandler.value);
+    splitMenuCloseHandler.value = null;
+  }
 }
 
 function copyContent() {
@@ -1404,9 +2153,25 @@ function openImageInNewTab(attachment: any): void {
   }
 }
 
+/**
+ * Get the image source URL for a content block.
+ * Supports both old format (inline base64 data) and new format (blobId reference).
+ */
+function getImageBlockSrc(block: any): string {
+  if (block.blobId) {
+    // NEW FORMAT: Load from blob endpoint
+    return `/api/blobs/${block.blobId}`;
+  } else if (block.data) {
+    // OLD FORMAT: Inline base64 data
+    return `data:${block.mimeType || 'image/png'};base64,${block.data}`;
+  }
+  return '';
+}
+
 function openImagePreview(block: any): void {
-  if (block.data) {
-    previewImageSrc.value = `data:${block.mimeType || 'image/png'};base64,${block.data}`;
+  const src = getImageBlockSrc(block);
+  if (src) {
+    previewImageSrc.value = src;
     previewImageAlt.value = block.revisedPrompt || 'Generated image';
     imagePreviewDialog.value = true;
   }
@@ -1439,6 +2204,20 @@ function formatTimestamp(timestamp: string | Date): string {
   
   // Otherwise show date
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
+}
+
+function copyMessageLink() {
+  const conversationId = props.message.conversationId;
+  const messageId = props.message.id;
+  const branchId = currentBranch.value.id;
+
+  const url = `${window.location.origin}/conversation/${conversationId}/message/${messageId}?branch=${branchId}`;
+
+  navigator.clipboard.writeText(url).then(() => {
+    console.log('[MessageComponent] Link copied to clipboard:', url);
+  }).catch(err => {
+    console.error('[MessageComponent] Failed to copy link:', err);
+  });
 }
 
 async function downloadPrompt() {
@@ -1531,6 +2310,9 @@ async function loadBookmark() {
 
     if (bookmark) {
       bookmarkLabel.value = bookmark.label;
+    } else {
+      // Clear bookmark label if no bookmark exists for this branch
+      bookmarkLabel.value = null;
     }
   } catch (error) {
     console.error('Failed to load bookmark:', error);
@@ -1592,6 +2374,22 @@ watch(() => currentBranch.value.id, async () => {
 </script>
 
 <style scoped>
+
+/* Authenticity icon wrapper in top right corner */
+.authenticity-corner-wrapper {
+  position: absolute;
+  top: -2px;
+  right: 8px;
+  opacity: 0.5;
+  transition: opacity 0.2s ease;
+  z-index: 10;
+  pointer-events: auto;
+}
+
+.authenticity-corner-wrapper:hover {
+  opacity: 1;
+}
+
 /* Post-hoc operation marker - compact inline display */
 .post-hoc-operation-marker {
   display: flex;
@@ -1626,9 +2424,32 @@ watch(() => currentBranch.value.id, async () => {
   opacity: 0.6;
 }
 
+.attachment-image-wrapper {
+  position: relative;
+  display: inline-block;
+  max-width: 300px;
+}
+
+.attachment-remove-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+}
+
 /* Messages affected by post-hoc edit operations */
 .post-hoc-edited {
   border-left: 3px solid rgb(var(--v-theme-info)) !important;
+}
+
+/* Human-written AI messages - distinct styling */
+.human-written-ai {
+  background: linear-gradient(135deg, rgba(233, 30, 99, 0.08) 0%, rgba(156, 39, 176, 0.05) 100%) !important;
+  border-left: 3px solid #E91E63 !important;
+}
+
+.human-written-ai .message-content {
+  /* Subtle italic for human-written AI content */
+  font-style: italic;
 }
 
 /* Mobile: full-width messages */
@@ -1728,6 +2549,11 @@ watch(() => currentBranch.value.id, async () => {
   overflow: visible;
   word-wrap: break-word;
   overflow-wrap: break-word;
+  /* Padding: top, left/right, and bottom. Bottom padding reserves space for the action bar
+     to prevent layout shift/flicker when hovering near the last message.
+     The action bar may slightly overlap content, but its semi-transparent background
+     keeps text readable.*/
+  padding: 12px 12px 28px 12px;
 }
 
 /* Desktop: left-right offsets */
@@ -1770,6 +2596,13 @@ watch(() => currentBranch.value.id, async () => {
 .branch-nav-row {
   display: flex;
   margin-bottom: 2px;
+}
+
+/* Branch counter in action bar */
+.branch-counter {
+  opacity: 0.8;
+  min-width: 28px;
+  text-align: center;
 }
 
 /* Hide inline branch nav on narrow screens */
@@ -1883,19 +2716,21 @@ watch(() => currentBranch.value.id, async () => {
 }
 
 /* Discord-style hover action bar */
-/* Action bar - floating at bottom-right of message */
+/* Action bar - floating at bottom-right corner, flush with message edges.
+   Positioned inside message bounds to prevent layout shifts on last message.
+   Semi-transparent so message text can be seen through it if overlapping. */
 .action-bar {
   position: absolute;
-  bottom: -36px;
-  right: 12px;
+  bottom: 0;
+  right: 0;
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 4px 8px;
-  background: rgb(var(--v-theme-surface));
-  border: 1px solid rgba(var(--v-theme-on-surface), 0.15);
-  border-radius: 6px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px 0 6px 0; /* Round only top-left and bottom-right to fit corner */
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   z-index: 100;
 }
 
@@ -1951,12 +2786,17 @@ watch(() => currentBranch.value.id, async () => {
 }
 
 .action-bar .v-btn {
-  opacity: 0.7;
-  min-width: 28px;
+  opacity: 0.75;
+  min-width: 24px;
+  height: 24px;
 }
 
 .action-bar .v-btn:hover {
   opacity: 1;
+}
+
+.action-bar .v-divider {
+  height: 14px !important;
 }
 
 /* Metadata dialog debug JSON */
@@ -1981,6 +2821,19 @@ watch(() => currentBranch.value.id, async () => {
 .touch-toggle-btn:focus {
   opacity: 0.8;
 }
+
+/* Prefix history card for forked conversations */
+.prefix-history-card {
+  background: rgb(var(--v-theme-surface)) !important;
+}
+
+.prefix-history-entry {
+  border-left: 3px solid rgba(var(--v-theme-primary), 0.5);
+}
+
+.prefix-history-entry.bg-grey-darken-3 {
+  border-left-color: rgba(var(--v-theme-primary), 0.7);
+}
 </style>
 
 <style>
@@ -1989,5 +2842,12 @@ watch(() => currentBranch.value.id, async () => {
   background-color: transparent !important;
   box-shadow: none !important;
 }
-</style>
 
+/* Split context menu - teleported to body, so unscoped */
+.split-context-menu {
+  position: fixed;
+  z-index: 9999;
+  /* Offset slightly so cursor doesn't immediately trigger close */
+  transform: translate(2px, 2px);
+}
+</style>

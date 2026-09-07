@@ -84,6 +84,7 @@
               :model-value="participant.model"
               @update:model-value="(value) => updateParticipantModel(participant, value)"
               :models="activeModels"
+              :availability="props.availability"
               density="compact"
               variant="plain"
               hide-details
@@ -197,6 +198,7 @@
             v-if="newParticipant.type === 'assistant'"
             v-model="newParticipant.model"
             :models="activeModels"
+            :availability="props.availability"
             label="Model"
             variant="outlined"
             density="compact"
@@ -228,7 +230,8 @@
     <!-- Advanced Settings Dialog -->
     <v-dialog
       v-model="showSettingsDialog"
-      max-width="600"
+      max-width="700"
+      scrollable
       @update:model-value="onSettingsDialogToggled"
     >
       <v-card v-if="selectedParticipantId">
@@ -250,7 +253,29 @@
             class="mb-4"
             placeholder="You are a helpful AI assistant..."
           />
-          
+
+          <!-- Persona Context: large private memory body injected per-participant -->
+          <div class="mb-4">
+            <v-textarea
+              :model-value="getParticipantField('personaContext', '')"
+              @update:model-value="(val) => setParticipantField('personaContext', val)"
+              label="Persona Context (private memories)"
+              variant="outlined"
+              rows="6"
+              hide-details
+              placeholder="Paste persona memories, conversation history, or other material private to this participant..."
+            />
+            <div v-if="getParticipantField('personaContext', '')" class="d-flex align-center mt-1">
+              <span class="text-caption text-grey">
+                ~{{ Math.ceil((getParticipantField('personaContext', '') as string).length / 4).toLocaleString() }} tokens
+              </span>
+              <v-spacer />
+              <span v-if="selectedParticipantModel" class="text-caption text-grey">
+                {{ Math.ceil(((selectedParticipantModel.contextWindow || 200000) - Math.ceil((getParticipantField('personaContext', '') as string).length / 4) - Math.ceil((getParticipantField('systemPrompt', '') as string).length / 4) - (getParticipantSettingsField('maxTokens', 4096) as number) - 2000)).toLocaleString() }} tokens available for conversation
+              </span>
+            </div>
+          </div>
+
           <v-slider
             :model-value="getParticipantSettingsField('temperature', 1.0)"
             @update:model-value="(val) => setParticipantSettingsField('temperature', val)"
@@ -280,17 +305,33 @@
             </template>
           </v-slider>
           
-          <v-text-field
-            :model-value="getParticipantSettingsField('maxTokens', 4096)"
-            @update:model-value="(val) => setParticipantSettingsField('maxTokens', Number(val))"
-            type="number"
-            label="Max Tokens"
-            variant="outlined"
-            hide-details
+          <v-slider
+            :model-value="getParticipantSettingsField('maxTokens', selectedParticipantModel?.settings?.maxTokens?.default || 4096)"
+            @update:model-value="(val) => setParticipantSettingsField('maxTokens', val)"
             :min="1"
             :max="selectedParticipantModel?.outputTokenLimit || 200000"
+            :step="1"
+            thumb-label
+            label="Max Tokens"
+            hide-details
             class="mb-4"
-          />
+            color="primary"
+          >
+            <template v-slot:append>
+              <v-text-field
+                :model-value="getParticipantSettingsField('maxTokens', selectedParticipantModel?.settings?.maxTokens?.default || 4096)"
+                @update:model-value="(val) => setParticipantSettingsField('maxTokens', Number(val))"
+                type="number"
+                density="compact"
+                style="width: 100px"
+                variant="outlined"
+                hide-details
+                single-line
+                :min="1"
+                :max="selectedParticipantModel?.outputTokenLimit || 200000"
+              />
+            </template>
+          </v-slider>
           
           <!-- Thinking Settings (for models that support it) -->
           <div v-if="selectedParticipantModel?.supportsThinking" class="mb-4">
@@ -435,7 +476,41 @@
               </v-list-item>
             </template>
           </v-select>
-          
+
+          <v-select
+            v-if="selectedParticipantConversationMode === 'pseudo-prefill'"
+            :model-value="selectedParticipantPseudoPrefillMode"
+            @update:model-value="(val) => setParticipantField('pseudoPrefillMode', val)"
+            :items="pseudoPrefillModeOptions"
+            item-title="title"
+            item-value="value"
+            label="Continuation method"
+            variant="outlined"
+            density="compact"
+            class="mb-3"
+          >
+            <template v-slot:item="{ props, item }">
+              <v-list-item v-bind="props">
+                <template v-slot:subtitle>
+                  {{ item.raw.description }}
+                </template>
+              </v-list-item>
+            </template>
+          </v-select>
+
+          <v-text-field
+            v-if="selectedParticipantConversationMode === 'pseudo-prefill'"
+            :model-value="selectedParticipantPseudoPrefillFilename"
+            @update:model-value="(val) => setParticipantField('pseudoPrefillFilename', val)"
+            label="Filename"
+            placeholder="conversation.txt"
+            variant="outlined"
+            density="compact"
+            class="mb-3"
+            hint="Filename used in the CLI simulation commands"
+            persistent-hint
+          />
+
           <v-alert
             type="info"
             variant="tonal"
@@ -477,6 +552,10 @@ const props = defineProps({
   models: {
     type: Array as PropType<Model[]>,
     required: true
+  },
+  availability: {
+    type: Object as PropType<{ userProviders: string[]; adminProviders: string[]; grantCurrencies: string[]; canOverspend: boolean; availableProviders: string[] } | null>,
+    default: null
   },
   personas: {
     type: Array as PropType<Persona[]>,
@@ -589,11 +668,39 @@ const conversationModeOptions = [
     description: 'Alternating user/assistant format (OpenAI compatible)'
   },
   {
+    value: 'pseudo-prefill',
+    title: 'Pseudo-Prefill',
+    description: 'CLI simulation trick for models without native prefill (Opus 4.6, Sonnet 4.6)'
+  },
+  {
     value: 'completion',
     title: 'Completion',
     description: 'OpenRouter completion mode (prompt field)'
   }
 ];
+
+const pseudoPrefillModeOptions = [
+  {
+    value: 'cat',
+    title: 'Full replay (cat)',
+    description: 'Model repeats conversation log then continues. More reliable, uses more output tokens.'
+  },
+  {
+    value: 'tail-cut',
+    title: 'Tail only (cut)',
+    description: 'Model outputs only new content. More efficient, may be less reliable.'
+  }
+];
+
+const selectedParticipantPseudoPrefillMode = computed(() => {
+  const participant = participants.value.find(p => p.id === selectedParticipantId.value);
+  return participant?.pseudoPrefillMode || 'cat';
+});
+
+const selectedParticipantPseudoPrefillFilename = computed(() => {
+  const participant = participants.value.find(p => p.id === selectedParticipantId.value);
+  return participant?.pseudoPrefillFilename || 'conversation.txt';
+});
 
 
 // generic functions for getting and setting participant fields
@@ -686,7 +793,7 @@ const selectedParticipantConversationMode = computed(() => {
 function updateParticipantConversationMode(mode: string) {
   const participant = participants.value.find(p => p.id === selectedParticipantId.value);
   if (participant) {
-    participant.conversationMode = mode as 'auto' | 'prefill' | 'messages' | 'completion';
+    participant.conversationMode = mode as 'auto' | 'prefill' | 'messages' | 'pseudo-prefill' | 'completion';
     emit('update:participants', [...participants.value]);
   }
 }

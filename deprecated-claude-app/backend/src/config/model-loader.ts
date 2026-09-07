@@ -30,6 +30,49 @@ export class ModelLoader {
     this.db = db;
   }
 
+  /**
+   * Overlay file for models added at runtime (admin "Census" panel).
+   * Kept beside models.json but NOT shipped by CI, so additions made on the
+   * server survive a deploy that overwrites models.json from the repo.
+   */
+  get localModelsPath(): string {
+    return process.env.MODELS_LOCAL_CONFIG_PATH ||
+      this.modelConfigPath.replace(/models\.json$/, 'models.local.json');
+  }
+
+  private async readLocalFile(): Promise<{ models: Model[]; overrides: Record<string, Partial<Model>> }> {
+    try {
+      const data = await readFile(this.localModelsPath, 'utf-8');
+      const parsed = JSON.parse(data);
+      return { models: parsed.models || [], overrides: parsed.overrides || {} };
+    } catch {
+      return { models: [], overrides: {} };
+    }
+  }
+
+  private async writeLocalFile(local: { models: Model[]; overrides: Record<string, Partial<Model>> }): Promise<void> {
+    const { writeFile } = await import('fs/promises');
+    await writeFile(this.localModelsPath, JSON.stringify(local, null, 2), 'utf-8');
+  }
+
+  async loadLocalModels(): Promise<Model[]> {
+    return (await this.readLocalFile()).models;
+  }
+
+  /** Per-model overrides (today: hidden) that survive a deploy. Models are
+   *  never removed from models.json: participants in existing conversations
+   *  are identified by model id. */
+  async loadLocalOverrides(): Promise<Record<string, Partial<Model>>> {
+    return (await this.readLocalFile()).overrides;
+  }
+
+  async setLocalOverride(id: string, patch: Partial<Model>): Promise<void> {
+    const local = await this.readLocalFile();
+    local.overrides[id] = { ...(local.overrides[id] || {}), ...patch };
+    await this.writeLocalFile(local);
+    await this.reloadModels();
+  }
+
   async loadModels(): Promise<Model[]> {
     if (this.models) {
       return this.models;
@@ -38,14 +81,56 @@ export class ModelLoader {
     try {
       const modelsData = await readFile(this.modelConfigPath, 'utf-8');
       const parsed = JSON.parse(modelsData);
-      this.models = parsed.models || [];
-      console.log(`Loaded ${this.models?.length || 0} models from ${this.modelConfigPath}`);
+      const base: Model[] = parsed.models || [];
+      const { models: local, overrides } = await this.readLocalFile();
+      const seen = new Set(base.map(m => m.id));
+      const merged = base.map(m => overrides[m.id] ? { ...m, ...overrides[m.id] } : m);
+      for (const m of local) {
+        if (seen.has(m.id)) {
+          console.warn(`models.local.json: id ${m.id} already in models.json — overlay entry ignored`);
+          continue;
+        }
+        seen.add(m.id);
+        merged.push(m);
+      }
+      this.models = merged;
+      console.log(`Loaded ${base.length} models from ${this.modelConfigPath}` +
+        (local.length ? ` + ${local.length} local from ${this.localModelsPath}` : ''));
       return this.models || [];
     } catch (error) {
       console.error(`Failed to load models from ${this.modelConfigPath}:`, error);
       // Return empty array as fallback
       return [];
     }
+  }
+
+  /** Append models to the overlay file and reload. Returns the ids added. */
+  async addLocalModels(entries: Model[]): Promise<string[]> {
+    const existing = await this.loadModels();
+    const ids = new Set(existing.map(m => m.id));
+    const local = await this.readLocalFile();
+    const added: string[] = [];
+    for (const e of entries) {
+      if (ids.has(e.id)) continue;
+      local.models.push(e);
+      ids.add(e.id);
+      added.push(e.id);
+    }
+    await this.writeLocalFile(local);
+    await this.reloadModels();
+    return added;
+  }
+
+  /** Remove a model from the overlay file (models.json entries are never
+   *  removed — see loadLocalOverrides). */
+  async removeLocalModel(id: string): Promise<boolean> {
+    const local = await this.readLocalFile();
+    const next = local.models.filter(m => m.id !== id);
+    if (next.length === local.models.length) return false;
+    local.models = next;
+    await this.writeLocalFile(local);
+    await this.reloadModels();
+    return true;
   }
 
   /**
@@ -72,6 +157,8 @@ export class ModelLoader {
       supportsThinking: um.supportsThinking,
       // User-defined models always accept general credits
       currencies: { credit: true },
+      // Include auto-detected capabilities
+      capabilities: um.capabilities,
       settings: {
         temperature: {
           min: 0,

@@ -1,8 +1,10 @@
 import { Message, getActiveBranch, ModelSettings, TokenUsage } from '@deprecated-claude/shared';
 import { Database } from '../database/index.js';
+import { getBlobStore } from '../database/blob-store.js';
 import { llmLogger } from '../utils/llmLogger.js';
 import { Logger } from '../utils/logger.js';
 import { logOpenRouterRequest, logOpenRouterResponse } from '../utils/openrouterLogger.js';
+import { isImageFile } from './attachment-utils.js';
 
 interface OpenRouterMessage {
   role: 'user' | 'assistant' | 'system';
@@ -34,6 +36,24 @@ interface OpenRouterResponse {
     // Anthropic cache fields (via OpenRouter)
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
+    // OpenRouter ground-truth cost — present when the request includes
+    // `usage: { include: true }` (which this service always sends).
+    // Authoritative; bypasses the pricing-table math when set.
+    cost?: number;
+    cost_details?: {
+      upstream_inference_cost?: number;
+      [key: string]: any;
+    };
+    // Reasoning/thinking output breakdown (some models). Billed inside
+    // `completion_tokens`, surfaced separately for accurate token attribution.
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
+      [key: string]: any;
+    };
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+      [key: string]: any;
+    };
   };
 }
 
@@ -91,7 +111,10 @@ export class OpenRouterService {
         usage: { include: true },
         provider: {
           order: ['Anthropic'],
-          allow_fallbacks: false
+          // Fallbacks must stay allowed: deprecated Anthropic models (e.g. Opus 4)
+          // have no Anthropic leg on OpenRouter anymore and are served via
+          // Google/Bedrock. allow_fallbacks: false made every such call 404.
+          allow_fallbacks: true
         },
         transforms: ['prompt-caching']
       };
@@ -155,13 +178,18 @@ export class OpenRouterService {
       // Complete the stream
       // NOTE: inputTokens = fresh only (non-cached), to match Anthropic semantics
       // enhanced-inference.ts will add cacheRead to get total
-      const actualUsage = {
+      const actualUsage: any = {
         inputTokens: freshInputTokens,
         outputTokens: completionTokens,
         cacheCreationInputTokens: 0, // OpenRouter doesn't distinguish
         cacheReadInputTokens: cachedTokens
       };
-      
+
+      // OpenRouter ground-truth cost (when present). Authoritative for billing.
+      if (typeof usage.cost === 'number') {
+        actualUsage.providerReportedCost = usage.cost;
+      }
+
       await onChunk('', true, undefined, actualUsage);
       
       return {
@@ -214,7 +242,19 @@ export class OpenRouterService {
           effectiveMaxTokens = minMaxTokens;
         }
       }
-      
+
+      // Build reasoning config: merges thinking budget (Anthropic/Gemini) and
+      // reasoning effort (OpenAI GPT-5 series) into OpenRouter's unified
+      // `reasoning` object. Both fields can coexist in theory.
+      const reasoningConfig: { max_tokens?: number; effort?: string } = {};
+      if (settings.thinking?.enabled && settings.thinking.budgetTokens) {
+        reasoningConfig.max_tokens = settings.thinking.budgetTokens;
+      }
+      const reasoningEffort = settings.modelSpecific?.reasoningEffort;
+      if (typeof reasoningEffort === 'string') {
+        reasoningConfig.effort = reasoningEffort;
+      }
+
       requestBody = {
         model: modelId,
         messages: openRouterMessages,
@@ -224,26 +264,25 @@ export class OpenRouterService {
         ...(settings.topP !== undefined && { top_p: settings.topP }),
         ...(settings.topK !== undefined && { top_k: settings.topK }),
         ...(stopSequences && stopSequences.length > 0 && { stop: stopSequences }),
-        
+
         // Required for cache metrics in response
         usage: { include: true },
-        
-        // Add reasoning/thinking support for models that support it
-        ...(settings.thinking?.enabled && settings.thinking.budgetTokens && {
-          reasoning: {
-            max_tokens: settings.thinking.budgetTokens
-          }
-        })
+
+        // Reasoning config (effort for OpenAI GPT-5, max_tokens for thinking models)
+        ...(Object.keys(reasoningConfig).length > 0 && { reasoning: reasoningConfig })
       };
       
       // For Anthropic models: force native provider and enable caching
       if (provider === 'anthropic') {
         requestBody.provider = {
           order: ['Anthropic'],
-          allow_fallbacks: false
+          // Prefer the native Anthropic leg (prompt caching), but keep fallbacks:
+          // deprecated models (Opus 4, 4.1, ...) exist only on Google/Bedrock legs,
+          // and allow_fallbacks: false turned them into a guaranteed 404.
+          allow_fallbacks: true
         };
         requestBody.transforms = ['prompt-caching'];
-        Logger.cache(`[OpenRouter] 🔒 Forcing native Anthropic with prompt-caching enabled`);
+        Logger.cache(`[OpenRouter] 🔒 Preferring native Anthropic (fallbacks allowed) with prompt-caching enabled`);
       }
       
       // Log reasoning configuration
@@ -297,11 +336,17 @@ export class OpenRouterService {
       let totalTokens = 0;
       let promptTokens = 0;
       let completionTokens = 0;
+      let reasoningTokens = 0;
+      // OpenRouter ground-truth cost. Set when the final SSE chunk carries
+      // `usage.cost` (we always request `usage: { include: true }`). Authoritative
+      // when set; passed through `actualUsage.providerReportedCost` so the cost
+      // tracker short-circuits the pricing-table math and surfaces drift.
+      let reportedCost: number | undefined;
       let cacheMetrics = {
         cacheCreationInputTokens: 0,
         cacheReadInputTokens: 0
       };
-      
+
       // Track reasoning/thinking content blocks
       const contentBlocks: any[] = [];
       let reasoningContent = '';
@@ -323,21 +368,44 @@ export class OpenRouterService {
               // OpenRouter's prompt_tokens is TOTAL (includes cached)
               // Report fresh tokens only, to match Anthropic semantics
               const freshInputTokens = promptTokens - cacheMetrics.cacheReadInputTokens;
-              
-              const actualUsage = {
+
+              const actualUsage: any = {
                 inputTokens: freshInputTokens,
                 outputTokens: completionTokens,
                 cacheCreationInputTokens: cacheMetrics.cacheCreationInputTokens,
-                cacheReadInputTokens: cacheMetrics.cacheReadInputTokens
+                cacheReadInputTokens: cacheMetrics.cacheReadInputTokens,
               };
-              
+
+              // Ground-truth cost from OpenRouter (when present). Marks this
+              // record as authoritative — enhanced-inference will use it as
+              // `cost` and log the delta vs. its table-computed value as
+              // `pricingDriftDelta` for table-drift detection.
+              if (reportedCost !== undefined) {
+                actualUsage.providerReportedCost = reportedCost;
+                Logger.cache(`[OpenRouter] 💰 Reported cost: $${reportedCost.toFixed(6)}`);
+              }
+
+              // OpenRouter's `reasoning_tokens` are a SUBSET of `completion_tokens`,
+              // not a separate count. To let the four-channel model apply a distinct
+              // `thinking` multiplier (configurable per model) without double-counting,
+              // we split:
+              //   outputTokens   = completion_tokens − reasoning_tokens   (non-thinking)
+              //   thinkingTokens = reasoning_tokens                        (thinking)
+              // With the default 1.0× thinking multiplier this billing is identical
+              // to the pre-split behaviour; admin config can override per model for
+              // premium reasoning rates.
+              if (reasoningTokens > 0 && reasoningTokens <= completionTokens) {
+                actualUsage.outputTokens = completionTokens - reasoningTokens;
+                actualUsage.thinkingTokens = reasoningTokens;
+              }
+
               // Include content blocks (reasoning) in final response
               const finalContentBlocks = contentBlocks.length > 0 ? contentBlocks : undefined;
-              
+
               if (hasReasoningStarted) {
                 console.log(`[OpenRouter] 🧠 Reasoning complete: ${reasoningContent.length} chars`);
               }
-              
+
               await onChunk('', true, finalContentBlocks, actualUsage);
               break;
             }
@@ -414,22 +482,32 @@ export class OpenRouterService {
               // Handle image generation responses (OpenRouter/Gemini image models)
               // OpenRouter returns images in delta.images array: [{type: "image_url", image_url: {url: "data:..."}}]
               // OpenRouter may send multiple versions of the same image - we keep only the latest one
-              const addOrReplaceImage = (mimeType: string, base64Data: string) => {
+              const addOrReplaceImage = async (mimeType: string, base64Data: string) => {
+                // Save image to BlobStore
+                const blobStore = getBlobStore();
+                const blobId = await blobStore.saveBlob(base64Data, mimeType);
+                
                 // Find existing image block index
                 const existingImageIndex = contentBlocks.findIndex((b: any) => b.type === 'image');
                 const imageBlock = {
                   type: 'image',
                   mimeType,
-                  data: base64Data
+                  blobId // Reference to blob instead of inline data
                 };
                 
                 if (existingImageIndex >= 0) {
+                  // Delete the old blob to prevent orphans
+                  const oldBlock = contentBlocks[existingImageIndex] as any;
+                  if (oldBlock.blobId && oldBlock.blobId !== blobId) {
+                    await blobStore.deleteBlob(oldBlock.blobId);
+                    console.log(`[OpenRouter] 🖼️ Deleted old preview blob ${oldBlock.blobId.substring(0, 8)}...`);
+                  }
                   // Replace existing image with the newer version
-                  console.log(`[OpenRouter] 🖼️ Replacing image with newer version: ${mimeType}, ${base64Data.length} bytes`);
+                  console.log(`[OpenRouter] 🖼️ Replacing image with blob ${blobId.substring(0, 8)}...`);
                   contentBlocks[existingImageIndex] = imageBlock;
                 } else {
                   // Add new image
-                  console.log(`[OpenRouter] 🖼️ Received generated image: ${mimeType}, ${base64Data.length} bytes`);
+                  console.log(`[OpenRouter] 🖼️ Saved generated image to blob: ${blobId.substring(0, 8)}... (${mimeType})`);
                   contentBlocks.push(imageBlock as any);
                 }
               };
@@ -442,7 +520,7 @@ export class OpenRouterService {
                     const dataUrl = img.image_url.url;
                     const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
                     if (match) {
-                      addOrReplaceImage(match[1], match[2]);
+                      await addOrReplaceImage(match[1], match[2]);
                     }
                   }
                 }
@@ -458,7 +536,7 @@ export class OpenRouterService {
                     const dataUrl = img.image_url.url;
                     const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
                     if (match) {
-                      addOrReplaceImage(match[1], match[2]);
+                      await addOrReplaceImage(match[1], match[2]);
                     }
                   }
                 }
@@ -467,12 +545,14 @@ export class OpenRouterService {
               
               // Also check for inlineData format (direct Gemini-style response)
               if (delta?.inlineData) {
+                const blobStore = getBlobStore();
+                const blobId = await blobStore.saveBlob(delta.inlineData.data, delta.inlineData.mimeType || 'image/png');
                 contentBlocks.push({
                   type: 'image',
                   mimeType: delta.inlineData.mimeType || 'image/png',
-                  data: delta.inlineData.data
+                  blobId
                 } as any);
-                console.log(`[OpenRouter] 🖼️ Received inline image: ${delta.inlineData.mimeType || 'image/png'}`);
+                console.log(`[OpenRouter] 🖼️ Saved inline image to blob: ${blobId.substring(0, 8)}...`);
                 await onChunk('', false, contentBlocks);
               }
               
@@ -486,7 +566,24 @@ export class OpenRouterService {
                 totalTokens = parsed.usage.total_tokens;
                 promptTokens = parsed.usage.prompt_tokens || 0;
                 completionTokens = parsed.usage.completion_tokens || 0;
-                
+
+                // OpenRouter ground-truth cost. Sent in the final SSE chunk
+                // when the request includes `usage: { include: true }` (this
+                // service always sends it). Authoritative — skips the pricing
+                // table downstream. We still want to log it even if the chunk
+                // is parsed multiple times; the value is monotonic for one call.
+                if (typeof parsed.usage.cost === 'number') {
+                  reportedCost = parsed.usage.cost;
+                }
+
+                // Reasoning tokens are billed inside `completion_tokens` already.
+                // Capturing the split so the four-channel cost model can apply
+                // a separate `thinking` multiplier if the model's pricing differs
+                // (e.g., overridden in admin config).
+                if (parsed.usage.completion_tokens_details?.reasoning_tokens !== undefined) {
+                  reasoningTokens = parsed.usage.completion_tokens_details.reasoning_tokens;
+                }
+
                 // OpenRouter format: cache info in prompt_tokens_details.cached_tokens
                 if (parsed.usage.prompt_tokens_details?.cached_tokens) {
                   // OpenRouter doesn't distinguish creation vs read, just reports cached
@@ -495,7 +592,7 @@ export class OpenRouterService {
                 } else {
                   Logger.cache(`[OpenRouter] ❌ No cache hit (cached_tokens: ${parsed.usage.prompt_tokens_details?.cached_tokens || 0})`);
                 }
-                
+
                 // Also check for native Anthropic format (fallback)
                 if (parsed.usage.cache_creation_input_tokens !== undefined) {
                   cacheMetrics.cacheCreationInputTokens = parsed.usage.cache_creation_input_tokens;
@@ -703,34 +800,20 @@ export class OpenRouterService {
           
           for (const attachment of activeBranch.attachments) {
             const extension = attachment.fileName.split('.').pop()?.toLowerCase() || '';
-            const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(extension);
+            const isImage = isImageFile(attachment.fileName);
             const isPdf = extension === 'pdf';
             
             if (isImage) {
-              // Add image - use Anthropic format for Claude, file format for others
+              // OpenRouter expects images in the OpenAI-style image_url shape,
+              // even when routing to Anthropic-backed Claude models.
               const mediaType = this.getMediaType(attachment.fileName, (attachment as any).mimeType);
-              
-              if (provider === 'anthropic') {
-                // Anthropic format for Claude models
-                contentBlocks.push({
-                  type: 'image',
-                  source: {
-                    type: 'base64',
-                    media_type: mediaType,
-                    data: attachment.content
-                  }
-                } as any);
-              } else {
-                // OpenRouter file format for other models (OpenAI, Gemini, etc.)
-                const fileData = `data:${mediaType};base64,${attachment.content}`;
-                contentBlocks.push({
-                  type: 'file',
-                  file: {
-                    filename: attachment.fileName,
-                    file_data: fileData,
-                  }
-                } as any);
-              }
+              const imageData = `data:${mediaType};base64,${attachment.content}`;
+              contentBlocks.push({
+                type: 'image_url',
+                image_url: {
+                  url: imageData
+                }
+              });
               console.log(`[OpenRouter] Added image attachment: ${attachment.fileName} (${mediaType})`);
             } else if (isPdf) {
               // OpenRouter PDF processing - uses file type with data URI format
@@ -783,9 +866,12 @@ export class OpenRouterService {
             }
           }
           
-          // Add cache control to the last content block if present
+          // For Anthropic-backed routes, keep the cache marker on a text block.
+          // OpenRouter documents images as image_url blocks, but may not forward
+          // cache_control from image_url to Anthropic's native cache controls.
           if (cacheControl && provider === 'anthropic') {
-            contentBlocks[contentBlocks.length - 1].cache_control = cacheControl;
+            const textBlock = [...contentBlocks].reverse().find(block => block.type === 'text');
+            (textBlock || contentBlocks[contentBlocks.length - 1]).cache_control = cacheControl;
             console.log(`[OpenRouter] 🎯 Cache control marker added to message with attachments`);
           }
           
@@ -794,14 +880,24 @@ export class OpenRouterService {
           // Assistant message with thinking blocks - format as content array for Anthropic API
           // This is required for models like Opus 4.5 to maintain chain of thought
           const apiContentBlocks: ContentBlock[] = [];
+          let unsignedThinkingText = ''; // Collect thinking without signatures to prepend as text
           
           for (const block of activeBranch.contentBlocks) {
             if (block.type === 'thinking') {
-              apiContentBlocks.push({
-                type: 'thinking',
-                thinking: block.thinking,
-                ...(block.signature && { signature: block.signature })
-              } as any);
+              // Only send thinking as structured block if it has a signature
+              // Anthropic API requires signatures to verify thinking authenticity
+              // Thinking without signatures (e.g., imported) is converted to text
+              if (block.signature) {
+                console.log(`[OpenRouter] Thinking block: text length=${block.thinking.length}, sig length=${block.signature.length}, sig prefix=${block.signature.substring(0, 20)}...`);
+                apiContentBlocks.push({
+                  type: 'thinking',
+                  thinking: block.thinking,
+                  signature: block.signature
+                } as any);
+              } else {
+                // Collect unsigned thinking to include as text
+                unsignedThinkingText += `<thinking>\n${block.thinking}\n</thinking>\n\n`;
+              }
             } else if (block.type === 'redacted_thinking') {
               apiContentBlocks.push({
                 type: 'redacted_thinking',
@@ -811,6 +907,21 @@ export class OpenRouterService {
               apiContentBlocks.push({
                 type: 'text',
                 text: block.text
+              });
+            }
+          }
+          
+          // If we have unsigned thinking, prepend it to the text content
+          if (unsignedThinkingText) {
+            const existingTextIndex = apiContentBlocks.findIndex(b => b.type === 'text');
+            if (existingTextIndex >= 0) {
+              // Prepend to existing text block
+              apiContentBlocks[existingTextIndex].text = unsignedThinkingText + apiContentBlocks[existingTextIndex].text;
+            } else {
+              // Create new text block with the thinking + main content
+              apiContentBlocks.push({
+                type: 'text',
+                text: unsignedThinkingText + activeBranch.content.trim()
               });
             }
           }

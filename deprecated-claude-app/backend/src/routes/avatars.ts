@@ -1,6 +1,4 @@
 import { Router, Request, Response } from 'express';
-import { z } from 'zod';
-import { AvatarPackSchema } from '@deprecated-claude/shared';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
@@ -22,16 +20,40 @@ const __dirname = path.dirname(__filename);
 
 const router = Router();
 
-// Avatar storage paths
-// From dist/routes/ we need to go up 3 levels to deprecated-claude-app, then into frontend
-const AVATARS_BASE_PATH = path.join(__dirname, '../../../frontend/public/avatars');
+// Avatar storage paths - configurable via environment variable
+// In production, this should point to the static files directory served by nginx
+// e.g., AVATARS_PATH=/var/www/frontend/avatars
+// In development, we use the frontend/public/avatars directory
+const getAvatarsBasePath = () => {
+  if (process.env.AVATARS_PATH) {
+    return process.env.AVATARS_PATH;
+  }
+  // Development default: From dist/routes/ go up 3 levels to deprecated-claude-app, then into frontend
+  return path.join(__dirname, '../../../frontend/public/avatars');
+};
+
+const AVATARS_BASE_PATH = getAvatarsBasePath();
 const SYSTEM_PACKS_PATH = path.join(AVATARS_BASE_PATH, 'system');
 const USER_PACKS_PATH = path.join(AVATARS_BASE_PATH, 'users');
 
+console.log(`[Avatars] Using avatar storage path: ${AVATARS_BASE_PATH}`);
+
+// Validate IDs used in file paths to prevent path traversal
+const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
+function isSafeId(id: string): boolean {
+  return SAFE_ID_RE.test(id) && !id.includes('..');
+}
+
 // Ensure directories exist
 async function ensureDirectories() {
-  await fs.mkdir(SYSTEM_PACKS_PATH, { recursive: true });
-  await fs.mkdir(USER_PACKS_PATH, { recursive: true });
+  try {
+    await fs.mkdir(SYSTEM_PACKS_PATH, { recursive: true });
+    await fs.mkdir(USER_PACKS_PATH, { recursive: true });
+  } catch (error: any) {
+    console.error(`[Avatars] Failed to create avatar directories at ${AVATARS_BASE_PATH}: ${error.message}`);
+    console.error(`[Avatars] Set AVATARS_PATH environment variable to a writable directory`);
+    throw error;
+  }
 }
 
 // Configure multer for avatar uploads - use memory storage for processing with sharp
@@ -161,6 +183,9 @@ router.get('/packs', async (req: Request, res) => {
 router.get('/packs/:packId', async (req: Request, res) => {
   try {
     const { packId } = req.params;
+    if (!isSafeId(packId)) {
+      return res.status(400).json({ error: 'Invalid pack ID' });
+    }
     const userId = (req as any).userId;
 
     // Try system pack first
@@ -244,9 +269,12 @@ router.put('/packs/:packId', async (req: Request, res) => {
   try {
     const userId = (req as any).userId;
     const { packId } = req.params;
-    
+
     if (!userId) {
       return res.status(401).json({ error: 'Authentication required' });
+    }
+    if (!isSafeId(packId)) {
+      return res.status(400).json({ error: 'Invalid pack ID' });
     }
 
     const packPath = path.join(USER_PACKS_PATH, userId, packId);
@@ -287,6 +315,9 @@ router.post('/packs/:packId/avatars', upload.single('avatar'), async (req: Multe
 
     if (!canonicalId) {
       return res.status(400).json({ error: 'canonicalId is required' });
+    }
+    if (!isSafeId(packId) || !isSafeId(canonicalId)) {
+      return res.status(400).json({ error: 'Invalid pack ID or avatar ID' });
     }
 
     if (!req.file || !req.file.buffer) {
@@ -337,6 +368,9 @@ router.delete('/packs/:packId/avatars/:canonicalId', async (req: Request, res) =
     if (!userId) {
       return res.status(401).json({ error: 'Authentication required' });
     }
+    if (!isSafeId(packId) || !isSafeId(canonicalId)) {
+      return res.status(400).json({ error: 'Invalid pack ID or avatar ID' });
+    }
 
     const packPath = path.join(USER_PACKS_PATH, userId, packId);
     const pack = await readPackJson(packPath);
@@ -385,6 +419,9 @@ router.put('/packs/:packId/colors/:canonicalId', async (req: Request, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Authentication required' });
     }
+    if (!isSafeId(packId) || !isSafeId(canonicalId)) {
+      return res.status(400).json({ error: 'Invalid pack ID or avatar ID' });
+    }
 
     const packPath = path.join(USER_PACKS_PATH, userId, packId);
     const pack = await readPackJson(packPath);
@@ -424,9 +461,12 @@ router.delete('/packs/:packId', async (req: Request, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Authentication required' });
     }
+    if (!isSafeId(packId)) {
+      return res.status(400).json({ error: 'Invalid pack ID' });
+    }
 
     const packPath = path.join(USER_PACKS_PATH, userId, packId);
-    
+
     // Check if pack exists
     try {
       await fs.access(packPath);
@@ -457,6 +497,9 @@ router.post('/packs/:packId/clone', async (req: Request, res) => {
 
     if (!newId || !newName) {
       return res.status(400).json({ error: 'newId and newName are required' });
+    }
+    if (!isSafeId(packId) || !isSafeId(newId)) {
+      return res.status(400).json({ error: 'Invalid pack ID' });
     }
 
     // Find source pack (try system first, then user)

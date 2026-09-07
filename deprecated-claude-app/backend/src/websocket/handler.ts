@@ -11,6 +11,7 @@ import { llmLogger } from '../utils/llmLogger.js';
 import { ModelLoader } from '../config/model-loader.js';
 import { roomManager } from './room-manager.js';
 import { USER_FACING_ERRORS } from '../utils/error-messages.js';
+import { checkContent, type UserContext } from '../services/content-filter.js';
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
@@ -70,6 +71,7 @@ interface BackroomPromptParams {
   modelSupportsPrefill?: boolean;
   participantConversationMode?: string;
   existingSystemPrompt: string;
+  cliModePrompt?: { enabled: boolean; messageThreshold: number };
 }
 
 function applyBackroomPromptIfNeeded(params: BackroomPromptParams): string {
@@ -79,16 +81,25 @@ function applyBackroomPromptIfNeeded(params: BackroomPromptParams): string {
     modelProvider,
     modelSupportsPrefill,
     participantConversationMode,
-    existingSystemPrompt
+    existingSystemPrompt,
+    cliModePrompt
   } = params;
   
-  // Only for group chats with fewer than 10 messages
-  if (conversationFormat !== 'prefill' || messageCount >= 10) {
+  // Check if CLI mode prompt is disabled by toggle
+  const cliEnabled = cliModePrompt?.enabled ?? true;
+  const threshold = cliModePrompt?.messageThreshold ?? 10;
+  
+  if (!cliEnabled) {
+    return existingSystemPrompt;
+  }
+  
+  // Only for group chats with fewer than threshold messages
+  if (conversationFormat !== 'prefill' || messageCount >= threshold) {
     return existingSystemPrompt;
   }
   
   // Check if model supports prefill
-  const supportsPrefill = modelProvider === 'anthropic' || modelProvider === 'bedrock' || modelSupportsPrefill === true;
+  const supportsPrefill = modelSupportsPrefill !== false && (modelProvider === 'anthropic' || modelProvider === 'bedrock' || modelSupportsPrefill === true);
   if (!supportsPrefill) {
     return existingSystemPrompt;
   }
@@ -101,10 +112,15 @@ function applyBackroomPromptIfNeeded(params: BackroomPromptParams): string {
     return existingSystemPrompt;
   }
   
+  // CLI mode is enabled and conditions are met - apply the backroom prompt
+  // If there's an existing system prompt, prepend the CLI prompt to it
+  if (existingSystemPrompt) {
+    Logger.websocket(`[WebSocket] Applied backroom prompt + custom prompt (${messageCount} messages, provider: ${modelProvider})`);
+    return `${BACKROOM_PROMPT}\n\n${existingSystemPrompt}`;
+  }
+  
   Logger.websocket(`[WebSocket] Applied backroom prompt (${messageCount} messages, provider: ${modelProvider})`);
-  return existingSystemPrompt 
-    ? `${BACKROOM_PROMPT}\n\n${existingSystemPrompt}`
-    : BACKROOM_PROMPT;
+  return BACKROOM_PROMPT;
 }
 
 /**
@@ -147,7 +163,7 @@ function applyIdentityPromptIfNeeded(params: IdentityPromptParams): string {
   }
   
   // Check if model supports prefill
-  const supportsPrefill = modelProvider === 'anthropic' || modelProvider === 'bedrock' || modelSupportsPrefill === true;
+  const supportsPrefill = modelSupportsPrefill !== false && (modelProvider === 'anthropic' || modelProvider === 'bedrock' || modelSupportsPrefill === true);
   
   // Determine if we're actually using messages mode
   // (either explicitly set to 'messages', or 'auto'/undefined with a model that doesn't support prefill)
@@ -180,7 +196,7 @@ function applyIdentityPromptIfNeeded(params: IdentityPromptParams): string {
  * @param includeMessage - Optional message to include/replace in the history
  * @returns Array of messages in chronological order (oldest first)
  */
-function buildConversationHistory(
+export function buildConversationHistory(
   allMessages: Message[],
   fromBranchId: string | undefined,
   includeMessage?: { messageId: string; message: Message }
@@ -206,9 +222,20 @@ function buildConversationHistory(
     }
     
     // Use the provided message if this is the one to replace
-    const messageToAdd = includeMessage && message.id === includeMessage.messageId 
+    let messageToAdd = includeMessage && message.id === includeMessage.messageId 
       ? includeMessage.message 
       : message;
+    
+    // CRITICAL: Ensure activeBranchId matches the branch we're traversing
+    // Without this, if user switched branches before regenerating, the prefill
+    // would contain content from the wrong branch!
+    if (messageToAdd.activeBranchId !== currentBranchId) {
+      messageToAdd = {
+        ...messageToAdd,
+        activeBranchId: currentBranchId
+      };
+      Logger.debug(`[buildConversationHistory] Fixed activeBranchId mismatch for message ${message.id.substring(0, 8)}`);
+    }
     
     // Add to beginning of history (we're building backwards)
     history.unshift(messageToAdd);
@@ -233,7 +260,7 @@ function buildConversationHistory(
  * @param messages - Array of messages to filter
  * @returns Array of messages with hiddenFromAi branches removed
  */
-function filterHiddenFromAiMessages(messages: Message[]): Message[] {
+export function filterHiddenFromAiMessages(messages: Message[]): Message[] {
   return messages
     .map(msg => {
       // Get the active branch
@@ -255,6 +282,18 @@ async function userHasSufficientCredits(db: Database, userId: string, modelId?: 
     const modelLoader = ModelLoader.getInstance();
     const model = await modelLoader.getModelById(modelId, userId);
     if (model) {
+      // Self-hosted custom endpoints (openai-compatible models with an embedded
+      // baseUrl) have no platform cost basis — pricing resolves to $0 and the
+      // inference path already bypasses the API-key manager for them
+      // (see InferenceService: `isCustomModelWithEndpoint`). Charging credits
+      // here would lock the user out of a model that costs the platform nothing,
+      // so skip the credit check entirely, mirroring the "user brought their own
+      // API key" exemption below.
+      if (model.customEndpoint) {
+        console.log(`[Credits] User ${userId} using custom-endpoint model ${model.id}, skipping credit check`);
+        return true;
+      }
+
       // Check if user has their own API key for this provider
       const userApiKeys = await db.getUserApiKeys(userId);
       const hasProviderKey = userApiKeys.some(key => key.provider === model.provider);
@@ -281,10 +320,316 @@ function sendInsufficientCreditsError(ws: AuthenticatedWebSocket): void {
   }));
 }
 
+/**
+ * Truncate messages to fit within the model's context window when persona context is present.
+ * The persona context is a fixed block injected into every API call, so conversation messages
+ * must fit in whatever space remains. Without persona context, returns messages unchanged.
+ */
+function truncateForPersonaBudget(
+  messages: any[],
+  personaContext: string | undefined,
+  systemPrompt: string,
+  maxOutputTokens: number,
+  contextWindow: number,
+  participantName: string
+): any[] {
+  if (!personaContext || !personaContext.trim()) return messages;
+
+  const estimateTokens = (text: string) => Math.ceil(text.length / 4);
+  const personaTokens = estimateTokens(personaContext);
+  const systemTokens = estimateTokens(systemPrompt);
+  const outputTokens = maxOutputTokens || 8192;
+  const safetyBuffer = 2000;
+  const available = contextWindow - personaTokens - systemTokens - outputTokens - safetyBuffer;
+
+  console.log(`[PersonaContext] Budget for ${participantName}: contextWindow=${contextWindow}, persona=${personaTokens}, system=${systemTokens}, output=${outputTokens}, available=${available}`);
+
+  if (available <= 0) {
+    console.warn(`[PersonaContext] WARNING: Persona context (${personaTokens} tokens) exceeds available budget for ${participantName}. Sending last message only.`);
+    // Return only the last message to maximize chance of a successful inference.
+    // Returning more risks exceeding the context window entirely.
+    return messages.slice(-1);
+  }
+
+  let totalTokens = 0;
+  let startIndex = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const branch = msg.branches?.find((b: any) => b.id === msg.activeBranchId) || msg.branches?.[0];
+    const msgTokens = estimateTokens(branch?.content || '');
+    if (totalTokens + msgTokens > available && startIndex < messages.length) break;
+    totalTokens += msgTokens;
+    startIndex = i;
+  }
+
+  if (startIndex > 0) {
+    console.log(`[PersonaContext] Truncating: keeping ${messages.length - startIndex}/${messages.length} messages (${totalTokens} est. tokens)`);
+    return messages.slice(startIndex);
+  }
+
+  return messages;
+}
+
+/**
+ * Parameters for running parallel branch inference.
+ * This shared utility handles creating multiple branches and running inference on them in parallel.
+ */
+interface ParallelInferenceParams {
+  ws: AuthenticatedWebSocket;
+  db: Database;
+  inferenceService: EnhancedInferenceService;
+  conversation: any; // Conversation object
+  targetMessage: Message; // The message to add branches to
+  initialBranchId: string; // The first branch ID (already created)
+  parentBranchId: string; // Parent branch for all new branches
+  samplingBranchCount: number; // Total number of branches to generate
+  modelConfig: any; // Model configuration
+  model: string; // Model ID
+  historyMessages: any[]; // Conversation history for inference
+  systemPrompt: string;
+  settings: any; // Inference settings
+  participants: Participant[];
+  responderParticipant?: Participant;
+  participantId?: string; // Participant ID for new branches
+  userContext: UserContext; // For content filtering
+  abortSignal: AbortSignal;
+  creationSource: 'inference' | 'regeneration';
+  conversationId: string; // For room broadcasts
+  personaContext?: string; // Per-participant persona context to inject
+}
+
+/**
+ * Run inference on multiple branches in parallel.
+ * Creates additional branches if samplingBranchCount > 1, then runs inference on all branches.
+ * @returns Array of branch IDs that were generated
+ */
+async function runParallelBranchInference(params: ParallelInferenceParams): Promise<string[]> {
+  const {
+    ws,
+    db,
+    inferenceService,
+    conversation,
+    targetMessage,
+    initialBranchId,
+    parentBranchId,
+    samplingBranchCount,
+    modelConfig,
+    model,
+    historyMessages,
+    systemPrompt,
+    settings,
+    participants,
+    responderParticipant,
+    participantId,
+    userContext,
+    abortSignal,
+    creationSource,
+    conversationId,
+    personaContext
+  } = params;
+
+  // Track branches to generate
+  const branchesToGenerate: { branchId: string; branchContent: string }[] = [
+    { branchId: initialBranchId, branchContent: '' }
+  ];
+
+  // Create additional branches if sampling multiple responses
+  if (samplingBranchCount > 1) {
+    for (let i = 1; i < samplingBranchCount; i++) {
+      // Add a new branch to the same message
+      // Use preserveActiveBranch: true to keep selection on the first branch
+      const newBranchMessage = await db.addMessageBranch(
+        targetMessage.id,
+        targetMessage.conversationId,
+        conversation.userId,
+        '', // empty content
+        'assistant',
+        parentBranchId,
+        model,
+        participantId,
+        undefined, // no attachments
+        ws.userId,  // user who triggered the generation
+        undefined, // hiddenFromAi
+        true,      // preserveActiveBranch - keep selection on first branch during parallel gen
+        creationSource
+      );
+      
+      if (newBranchMessage) {
+        const newBranch = newBranchMessage.branches[newBranchMessage.branches.length - 1];
+        branchesToGenerate.push({ branchId: newBranch.id, branchContent: '' });
+        
+        // Update our local targetMessage with the new branch
+        targetMessage.branches.push(newBranch);
+        
+        // Send branch created notification
+        const editEvent = { type: 'message_edited', message: targetMessage };
+        ws.send(JSON.stringify(editEvent));
+        
+        // Broadcast to other users
+        roomManager.broadcastToRoom(conversationId, {
+          type: 'message_edited',
+          message: targetMessage,
+          fromUserId: ws.userId
+        }, ws);
+      }
+    }
+    
+    console.log(`[ParallelInference] Created ${branchesToGenerate.length} branches for parallel sampling`);
+  }
+  
+  // Helper function to safely send WebSocket messages (may fail if user disconnected)
+  const safeSend = (data: any) => {
+    try {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify(data));
+      } else {
+        // Log when we can't send important messages
+        if (data.isComplete) {
+          console.warn(`[WebSocket] Could not send isComplete for branch ${data.branchId?.substring(0, 8)}... - connection state: ${ws.readyState}`);
+        }
+      }
+    } catch (e) {
+      // Log error with context for important messages
+      if (data.isComplete) {
+        console.error(`[WebSocket] Error sending isComplete for branch ${data.branchId?.substring(0, 8)}...:`, e);
+      }
+    }
+  };
+  
+  // Helper function to run inference for a single branch
+  const runBranchInference = async (branchId: string, branchIndex: number) => {
+    let branchContent = '';
+    
+    await inferenceService.streamCompletion(
+      modelConfig,
+      historyMessages,
+      systemPrompt,
+      settings,
+      conversation.userId,
+      async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
+        // Update branch content
+        branchContent += chunk;
+        
+        // Find the branch in our message
+        const currentBranch = targetMessage.branches.find((b: any) => b.id === branchId);
+        if (currentBranch) {
+          currentBranch.content = branchContent;
+          
+          // Store content blocks if provided
+          if (contentBlocks && contentBlocks.length > 0) {
+            currentBranch.contentBlocks = contentBlocks;
+          }
+          
+          // Save partial content every 500 characters to prevent data loss
+          if (branchContent.length % 500 === 0 || isComplete) {
+            await db.updateMessageContent(
+              targetMessage.id,
+              targetMessage.conversationId,
+              conversation.userId,
+              branchId,
+              branchContent,
+              currentBranch.contentBlocks
+            );
+          }
+        }
+        
+        // Send stream update with branchIndex for client tracking
+        const streamData = {
+          type: 'stream',
+          messageId: targetMessage.id,
+          branchId: branchId,
+          content: chunk,
+          contentBlocks: contentBlocks,
+          isComplete,
+          branchIndex
+        };
+        safeSend(streamData);
+        
+        // Broadcast to other users in the room
+        roomManager.broadcastToRoom(conversationId, streamData, ws);
+        
+        // Handle completion
+        if (isComplete) {
+          const finalBranch = targetMessage.branches.find((b: any) => b.id === branchId);
+          if (finalBranch) {
+            // Trim whitespace from final content
+            finalBranch.content = branchContent.trim();
+            branchContent = finalBranch.content;
+            
+            // Content filter check for AI output with tiered moderation
+            const outputFilterResult = await checkContent(finalBranch.content, userContext);
+            if (outputFilterResult.blocked) {
+              console.warn(`[Content Filter] AI output blocked for conversation ${conversationId}`);
+              finalBranch.content = '[Content filtered]';
+              finalBranch.contentBlocks = undefined;
+              branchContent = finalBranch.content;
+              
+              // Send filter event to replace streamed content
+              const filterEvent = {
+                type: 'stream',
+                conversationId: conversationId,
+                messageId: targetMessage.id,
+                branchId: branchId,
+                content: finalBranch.content,
+                contentBlocks: undefined,
+                isComplete: true,
+                filtered: true
+              };
+              safeSend(filterEvent);
+              roomManager.broadcastToRoom(conversationId, filterEvent, ws);
+            }
+            
+            // Final save
+            await db.updateMessageContent(
+              targetMessage.id,
+              targetMessage.conversationId,
+              conversation.userId,
+              branchId,
+              finalBranch.content,
+              finalBranch.contentBlocks
+            );
+          }
+        }
+      },
+      conversation,
+      responderParticipant,
+      async (metrics) => {
+        // Store metrics only for first branch to avoid duplicate counting
+        if (branchIndex === 0) {
+          await db.addMetrics(conversation.id, conversation.userId, metrics);
+
+          // Send metrics update to client
+          safeSend({
+            type: 'metrics_update',
+            conversationId: conversation.id,
+            metrics,
+            branchIndex
+          });
+        }
+      },
+      participants,
+      abortSignal,
+      personaContext
+    );
+    
+    return branchContent;
+  };
+  
+  // Run inference for all branches in parallel
+  await Promise.all(
+    branchesToGenerate.map((branch, index) => runBranchInference(branch.branchId, index))
+  );
+  
+  // Return the branch IDs that were generated
+  return branchesToGenerate.map(b => b.branchId);
+}
+
 export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessage, db: Database) {
-  // Extract token from query params
+  // Extract token from Sec-WebSocket-Protocol header (preferred) or query params (legacy fallback)
+  const protocols = req.headers['sec-websocket-protocol']?.split(',').map(s => s.trim()) || [];
+  const protocolToken = protocols.find(p => p !== 'arc-auth');
   const url = new URL(req.url || '', `http://${req.headers.host}`);
-  const token = url.searchParams.get('token');
+  const token = protocolToken || url.searchParams.get('token');
 
   if (!token) {
     ws.send(JSON.stringify({ type: 'error', error: 'Authentication required' }));
@@ -349,15 +694,21 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
           break;
         
         case 'join_room':
-          handleJoinRoom(ws, message);
+          await handleJoinRoom(ws, message, db);
           break;
-        
+
         case 'leave_room':
           handleLeaveRoom(ws, message);
           break;
         
         case 'typing':
-          handleTyping(ws, message, db);
+          await handleTyping(ws, message, db);
+          break;
+        
+        case 'ping':
+          // Client-side keep-alive ping - respond with pong to confirm connection is alive
+          // This is separate from WebSocket protocol-level ping/pong
+          ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           break;
           
         default:
@@ -410,14 +761,22 @@ function handleAbort(
 }
 
 // Multi-user room handlers
-function handleJoinRoom(
+async function handleJoinRoom(
   ws: AuthenticatedWebSocket,
-  message: { type: 'join_room'; conversationId: string }
+  message: { type: 'join_room'; conversationId: string },
+  db: Database
 ) {
   if (!ws.userId) return;
-  
+
+  // Verify user has access to this conversation before joining the room
+  const conversation = await db.getConversation(message.conversationId, ws.userId);
+  if (!conversation) {
+    ws.send(JSON.stringify({ type: 'error', error: 'Access denied' }));
+    return;
+  }
+
   roomManager.joinRoom(message.conversationId, ws);
-  
+
   // Send back room state
   ws.send(JSON.stringify({
     type: 'room_joined',
@@ -447,7 +806,11 @@ async function handleTyping(
   db: Database
 ) {
   if (!ws.userId) return;
-  
+
+  // Verify user has access to this conversation
+  const conversation = await db.getConversation(message.conversationId, ws.userId);
+  if (!conversation) return;
+
   // Get user info for display
   const user = await db.getUserById(ws.userId);
   const userDisplayName = user?.email?.split('@')[0] || 'Someone'; // Use username part of email
@@ -482,6 +845,23 @@ async function handleChatMessage(
   const canChat = await db.canUserChatInConversation(message.conversationId, ws.userId);
   if (!canChat) {
     ws.send(JSON.stringify({ type: 'error', error: 'You do not have permission to send messages in this conversation' }));
+    return;
+  }
+
+  // Content filter check with tiered moderation
+  const isResearcher = await db.userHasActiveGrantCapability(ws.userId, 'researcher');
+  const isAgeVerified = await db.isUserAgeVerified(ws.userId);
+  const isAdmin = await db.userHasActiveGrantCapability(ws.userId, 'admin');
+  const userContext: UserContext = { isResearcher, isAgeVerified, isAdmin };
+  
+  // Always check content - the filter applies tiered logic based on user context
+  const filterResult = await checkContent(message.content, userContext);
+  if (filterResult.blocked) {
+    ws.send(JSON.stringify({ 
+      type: 'content_blocked',
+      reason: filterResult.reason || 'Message blocked by content filter',
+      categories: filterResult.categories
+    }));
     return;
   }
 
@@ -526,7 +906,9 @@ async function handleChatMessage(
         message.participantId,
         attachments,
         ws.userId, // sentByUserId - actual user who sent this
-        message.hiddenFromAi // whether message is hidden from AI
+        message.hiddenFromAi, // whether message is hidden from AI
+        false,     // preserveActiveBranch - select this new branch
+        'human_edit' // creationSource - user messages are human-authored
       );
     } else {
       // No siblings exist yet, create a new message
@@ -541,7 +923,8 @@ async function handleChatMessage(
         message.participantId,
         attachments,
         ws.userId, // sentByUserId - actual user who sent this
-        message.hiddenFromAi // whether message is hidden from AI
+        message.hiddenFromAi, // whether message is hidden from AI
+        'human_edit' // creationSource - user messages are human-authored
       );
     }
   } else {
@@ -556,7 +939,8 @@ async function handleChatMessage(
       message.participantId,
       attachments,
       ws.userId, // sentByUserId - actual user who sent this
-      message.hiddenFromAi // whether message is hidden from AI
+      message.hiddenFromAi, // whether message is hidden from AI
+      'human_edit' // creationSource - user messages are human-authored
     );
   }
   
@@ -657,7 +1041,11 @@ async function handleChatMessage(
       userBranch?.id,
       responder.model || conversation.model,
       responder.id,
-      undefined // no attachments for assistant
+      undefined, // no attachments for assistant
+      ws.userId, // user who triggered the generation
+      undefined, // hiddenFromAi
+      false,     // preserveActiveBranch - select this new branch
+      'inference' // creationSource - AI generated
     );
   } else {
     // No siblings exist yet, create a new message
@@ -668,7 +1056,11 @@ async function handleChatMessage(
       'assistant',
       responder.model || conversation.model,
       userBranch?.id,
-      responder.id
+      responder.id,
+      undefined, // no attachments for assistant
+      ws.userId, // user who triggered the generation
+      undefined, // hiddenFromAi
+      'inference' // creationSource - AI generated
     );
   }
   
@@ -732,8 +1124,8 @@ async function handleChatMessage(
           maxTokens: responder.settings?.maxTokens ?? conversation.settings.maxTokens,
           topP: responder.settings?.topP ?? conversation.settings.topP,
           topK: responder.settings?.topK ?? conversation.settings.topK,
-          // Always use conversation-level thinking settings
-          thinking: conversation.settings.thinking,
+          // Use participant thinking settings if defined, otherwise fall back to conversation
+          thinking: responder.settings?.thinking ?? conversation.settings.thinking,
           // Include model-specific settings (e.g., image resolution)
           modelSpecific: responder.settings?.modelSpecific ?? conversation.settings.modelSpecific
         };
@@ -782,240 +1174,191 @@ async function handleChatMessage(
       modelProvider: modelConfig.provider,
       modelSupportsPrefill: modelConfig.supportsPrefill,
       participantConversationMode: responder.conversationMode,
-      existingSystemPrompt: inferenceSystemPrompt || ''
+      existingSystemPrompt: inferenceSystemPrompt || '',
+      cliModePrompt: conversation.cliModePrompt
     });
     
     // Create abort controller for this generation
     const abortController = startGeneration(conversation.userId, conversation.id);
-    
+
     // Track AI request in room manager for multi-user sync
     roomManager.startAiRequest(message.conversationId, ws.userId!, assistantMessage.id);
-    
-    try {
-    // Prepare all branches for parallel sampling
-    const branchesToGenerate: Array<{ branchId: string; branchContent: string }> = [
-      { branchId: assistantMessage.activeBranchId, branchContent: '' }
-    ];
-    
-    // Create additional branches if sampling multiple responses
-    if (samplingBranchCount > 1) {
-      for (let i = 1; i < samplingBranchCount; i++) {
-        // Add a new branch to the same assistant message
-        const newBranchMessage = await db.addMessageBranch(
-          assistantMessage.id,
-          assistantMessage.conversationId,
-          conversation.userId,
-          '', // empty content
-          'assistant',
-          userBranch?.id, // same parent as first branch
-          responder.model || conversation.model,
-          responder.id,
-          undefined // no attachments
-        );
-        
-        if (newBranchMessage) {
-          const newBranch = newBranchMessage.branches[newBranchMessage.branches.length - 1];
-          branchesToGenerate.push({ branchId: newBranch.id, branchContent: '' });
-          
-          // Update our local assistantMessage with the new branch
-          assistantMessage.branches.push(newBranch);
-          
-          // Send branch created notification
-          ws.send(JSON.stringify({
-            type: 'message_edited',
-            message: assistantMessage
-          }));
-          
-          // Broadcast to other users
-          roomManager.broadcastToRoom(message.conversationId, {
-            type: 'message_edited',
-            message: assistantMessage,
-            fromUserId: ws.userId
-          }, ws);
-        }
-      }
-      
-      console.log(`[Chat] Created ${branchesToGenerate.length} branches for parallel sampling`);
-    }
-    
-    // Helper function to run inference for a single branch
-    const runBranchInference = async (branchId: string, branchIndex: number) => {
-      let branchContent = '';
-    
-    await inferenceService.streamCompletion(
-      modelConfig,
+
+    // Per-participant context budgeting
+    const responderPersonaContext = responder.personaContext;
+    const truncatedMessages = truncateForPersonaBudget(
       messagesForInference,
+      responderPersonaContext,
       inferenceSystemPrompt || '',
-      inferenceSettings,
-      conversation.userId,
-      async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
-          // Update branch content
-          branchContent += chunk;
-          
-          // Find the branch in our message
-          const currentBranch = assistantMessage.branches.find((b: any) => b.id === branchId);
-        if (currentBranch) {
-            currentBranch.content = branchContent;
-          
-          // Store content blocks if provided
-          if (contentBlocks && contentBlocks.length > 0) {
-            currentBranch.contentBlocks = contentBlocks;
-          }
-          
-          // Save partial content every 500 characters to prevent data loss on interruption
-            if (branchContent.length % 500 === 0 || isComplete) {
-            await db.updateMessageContent(
-              assistantMessage.id,
-              assistantMessage.conversationId,
-              conversation.userId,
-                branchId,
-                branchContent,
-              currentBranch.contentBlocks
-            );
-          }
-        }
-
-        // Send stream update
-        const streamData = {
-          type: 'stream',
-          messageId: assistantMessage.id,
-            branchId: branchId,
-          content: chunk,
-          contentBlocks: contentBlocks,
-            isComplete,
-            branchIndex: branchIndex // Let client know which branch this is for
-        };
-        
-          // Log content blocks being sent (only when there are blocks and no text chunk)
-        if (contentBlocks && contentBlocks.length > 0 && !chunk) {
-            console.log(`[WebSocket] Branch ${branchIndex}: Sending content blocks:`, contentBlocks.length, 'types:', contentBlocks.map((b: any) => b.type));
-        }
-        
-          // Send to original requester
-        ws.send(JSON.stringify(streamData));
-          
-          // Broadcast to all other users in the room
-          roomManager.broadcastToRoom(message.conversationId, streamData, ws);
-
-        if (isComplete) {
-            // Final save
-            const finalBranch = assistantMessage.branches.find((b: any) => b.id === branchId);
-            if (finalBranch) {
-              // Trim leading/trailing whitespace from final content
-              finalBranch.content = branchContent.trim();
-              
-            await db.updateMessageContent(
-              assistantMessage.id,
-              assistantMessage.conversationId,
-              conversation.userId,
-                branchId,
-                finalBranch.content,
-                finalBranch.contentBlocks
-              );
-            }
-        }
-      },
-      conversation,
-      responder,
-      async (metrics) => {
-          // Store metrics in database (only for first branch to avoid duplicate counting)
-          if (branchIndex === 0) {
-        await db.addMetrics(conversation.id, conversation.userId, metrics);
-        
-        // Send metrics update to client
-        ws.send(JSON.stringify({
-          type: 'metrics_update',
-          conversationId: conversation.id,
-              metrics,
-              branchIndex
-            }));
-          }
-        },
-        participants,
-        abortController.signal
-      );
-    };
-    
-    // Run all branches in parallel
-    await Promise.all(
-      branchesToGenerate.map((branch, index) =>
-        runBranchInference(branch.branchId, index)
-      )
+      inferenceSettings.maxTokens || 8192,
+      modelConfig.contextWindow || 200000,
+      responder.name
     );
 
-    // Capture debug request/response for researchers
-    console.log('[DEBUG CAPTURE] Starting debug data capture...');
+    let generatedBranchIds: string[];
     try {
-      // Get the raw API request that was just sent
+      // Run parallel inference using shared utility
+      generatedBranchIds = await runParallelBranchInference({
+        ws,
+        db,
+        inferenceService,
+        conversation,
+        targetMessage: assistantMessage,
+        initialBranchId: assistantMessage.activeBranchId,
+        parentBranchId: userBranch?.id || 'root',
+        samplingBranchCount,
+        modelConfig,
+        model: responder.model || conversation.model,
+        historyMessages: truncatedMessages,
+        systemPrompt: inferenceSystemPrompt || '',
+        settings: inferenceSettings,
+        participants,
+        responderParticipant: responder,
+        participantId: responder.id,
+        userContext,
+        abortSignal: abortController.signal,
+        creationSource: 'inference',
+        conversationId: message.conversationId,
+        personaContext: responderPersonaContext
+      });
+    
+    // DEBUG CAPTURE: Capture debug data for the first branch after completion
+    try {
       const rawRequest = baseInferenceService.lastRawRequest;
-      console.log(`[DEBUG CAPTURE] Raw request available: ${!!rawRequest}`);
-
-      if (rawRequest) {
-        // Store debug data on each generated branch
-        console.log(`[DEBUG CAPTURE] Processing ${branchesToGenerate.length} branches`);
-        // Compute actual format used (same logic as applyBackroomPromptIfNeeded)
-        const modelSupportsPrefill = modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true;
-        const participantMode = responder.conversationMode;
-        const wantsPrefill = !participantMode || participantMode === 'auto' || participantMode === 'prefill';
-        const actualFormat = (conversation.format === 'prefill' && modelSupportsPrefill && wantsPrefill) ? 'prefill' : 'messages';
-        
-        for (const branch of branchesToGenerate) {
-          const branchObj = assistantMessage.branches.find((b: any) => b.id === branch.branchId);
-          console.log(`[DEBUG CAPTURE] Branch ${branch.branchId}: branchObj found = ${!!branchObj}`);
-          if (branchObj) {
-            // Store the raw API request with inference metadata
-            const debugRequest = {
-              ...rawRequest,
-              provider: modelConfig.provider,
-              settings: inferenceSettings,
-              // Inference format metadata
-              conversationFormat: conversation.format,
-              participantConversationMode: participantMode || 'auto',
-              actualFormatUsed: actualFormat
-            };
-
-            // Store the response (content is already in the branch)
-            const debugResponse = {
-              content: branchObj.content,
-              contentBlocks: branchObj.contentBlocks,
-              model: branchObj.model
-            };
-
-            console.log(`[DEBUG CAPTURE] Updating message branch ${branch.branchId}...`);
-            await db.updateMessageBranch(
-              assistantMessage.id,
-              conversation.userId,
-              branch.branchId,
-              {
-                debugRequest,
-                debugResponse
-              }
-            );
-            console.log(`[DEBUG CAPTURE] Branch ${branch.branchId} updated successfully`);
-
-            // Send update to frontend so bug icon appears immediately
-            const updatedMessage = await db.getMessage(assistantMessage.id, conversation.id, conversation.userId);
-            if (updatedMessage) {
-              const updateEvent = {
-                type: 'message_edited',
-                message: updatedMessage
-              };
-              ws.send(JSON.stringify(updateEvent));
-              roomManager.broadcastToRoom(conversation.id, updateEvent, ws);
-            }
+      if (rawRequest && generatedBranchIds.length > 0) {
+        const firstBranchId = generatedBranchIds[0];
+        const branchObj = assistantMessage.branches.find((b: any) => b.id === firstBranchId);
+        if (branchObj) {
+          console.log(`[DEBUG CAPTURE] Capturing debug data for branch ${firstBranchId.substring(0, 8)}...`);
+          
+          // Compute actual format used
+          const modelSupportsPrefill = modelConfig.supportsPrefill !== false && (modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true);
+          const participantMode = responder.conversationMode;
+          const wantsPrefill = !participantMode || participantMode === 'auto' || participantMode === 'prefill';
+          const actualFormat = (conversation.format === 'prefill' && modelSupportsPrefill && wantsPrefill) ? 'prefill' : 'messages';
+          
+          const debugRequest = {
+            ...rawRequest,
+            provider: modelConfig.provider,
+            settings: inferenceSettings,
+            conversationFormat: conversation.format,
+            participantConversationMode: participantMode || 'auto',
+            actualFormatUsed: actualFormat
+          };
+          
+          const debugResponse = {
+            content: branchObj.content,
+            contentBlocks: branchObj.contentBlocks,
+            model: branchObj.model
+          };
+          
+          await db.updateMessageBranch(
+            assistantMessage.id,
+            conversation.userId,
+            firstBranchId,
+            { debugRequest, debugResponse }
+          );
+          
+          console.log(`[DEBUG CAPTURE] Debug data saved for branch ${firstBranchId.substring(0, 8)}`);
+          
+          // Notify frontend
+          const updatedMessage = await db.getMessage(assistantMessage.id, conversation.id, conversation.userId);
+          if (updatedMessage) {
+            ws.send(JSON.stringify({ type: 'message_edited', message: updatedMessage }));
+            roomManager.broadcastToRoom(conversation.id, { type: 'message_edited', message: updatedMessage }, ws);
           }
         }
-        console.log('[DEBUG CAPTURE] Debug data capture complete');
-      } else {
-        console.log('[DEBUG CAPTURE] No raw request available (non-Anthropic provider?)');
       }
     } catch (debugError) {
       console.error('[DEBUG CAPTURE] Failed to capture debug data:', debugError);
-      // Don't fail the whole request if debug capture fails
     }
 
     // Update conversation timestamp after all branches complete
     await db.updateConversation(conversation.id, conversation.userId, { updatedAt: new Date() });
+
+    try {
+      const needsTitle = !conversation.title || conversation.title === 'New Conversation';
+      
+      // Check if this is the first assistant message in the conversation
+      // We check filteredHistory length (which is previous messages) + 1 (current user message)
+      // If it's small (e.g., just 1 user message), it's the start.
+      const isFirstExchange = filteredHistory.length <= 1;
+
+
+      if (needsTitle && isFirstExchange) {
+        const firstUserMessage = filteredHistory.find(m => {
+          const activeBranch = m.branches.find(b => b.id === m.activeBranchId);
+          return activeBranch?.role === 'user';
+        });
+        const firstAssistantContent = generatedBranchIds.length > 0 
+          ? assistantMessage.branches.find((b: any) => b.id === generatedBranchIds[0])?.content 
+          : undefined;
+        if (firstUserMessage && firstAssistantContent) {
+          // Get the active branch's content, not branches[0]
+          const userActiveBranch = firstUserMessage.branches.find(b => b.id === firstUserMessage.activeBranchId);
+          const userContent = userActiveBranch?.content?.substring(0, 500) ?? '';
+          
+          const titlePrompt = `Generate a short, concise title (3-6 words) for this conversation. Output only the title text, no formatting or markdown:\n\nUser: ${userContent}\n\nAssistant: ${firstAssistantContent.substring(0, 500)}`;
+          // Use baseInferenceService for a raw, simple call
+          // Signature: (modelId, messages, systemPrompt, settings, userId, onChunk, format, ...)
+          let generatedTitle = '';
+          const tempBranchId = 'temp-branch-' + Date.now();
+          const tempMessage: any = {
+            id: 'temp-title-msg',
+            conversationId: 'temp',
+            userId: conversation.userId,
+            activeBranchId: tempBranchId,
+            branches: [{
+              id: tempBranchId,
+              content: titlePrompt,
+              role: 'user',
+              createdAt: new Date(),
+              isActive: true,
+              parentBranchId: 'root'
+            }],
+            order: 0
+          };
+
+          await baseInferenceService.streamCompletion(
+            responder.model || conversation.model,
+            [tempMessage],
+            'You are a helpful assistant.',
+            { temperature: 0.7, maxTokens: 50 },
+            conversation.userId,
+            async (chunk: string) => {
+              generatedTitle += chunk;
+            }
+          );
+
+
+          const cleanTitle = generatedTitle.trim()
+            .replace(/^#+\s*/, '')           // Remove markdown heading markers
+            .replace(/^\*\*(.+)\*\*$/, '$1') // Remove ** only if it wraps the ENTIRE title
+            .replace(/^["']|["']$/g, '')     // Remove quotes at start/end
+            .substring(0, 60);
+
+
+          if (cleanTitle) {
+            await db.updateConversation(conversation.id, conversation.userId, { title: cleanTitle });
+            
+            // Notify frontend
+            const updatedConv = await db.getConversation(conversation.id, conversation.userId);
+            if (updatedConv) {
+               ws.send(JSON.stringify({ 
+                 type: 'conversation_updated', 
+                 id: conversation.id,
+                 updates: { 
+                   title: cleanTitle,
+                   updatedAt: updatedConv.updatedAt
+                 }
+               }));
+            }
+          }
+        }
+      }
+    } catch (titleError) {
+      console.error('[Auto-title] Failed to generate title:', titleError);
+    }
     
     } finally {
       endGeneration(conversation.userId, conversation.id);
@@ -1056,6 +1399,11 @@ async function handleChatMessage(
     } else if (errorMsg.includes('Rate limit') || errorMsg.includes('rate_limit') || errorMsg.includes('429')) {
       friendlyError = USER_FACING_ERRORS.RATE_LIMIT.message;
       suggestion = USER_FACING_ERRORS.RATE_LIMIT.suggestion;
+    } else if (errorMsg.includes('usage limit') || errorMsg.includes('API usage limit')) {
+      // Extract the specific message from API response
+      const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
+      friendlyError = jsonMatch ? jsonMatch[1] : 'You have reached your API usage limits.';
+      suggestion = 'Check your API provider\'s billing settings to increase your limit.';
     } else if (errorMsg.includes('overloaded') || errorMsg.includes('503')) {
       friendlyError = USER_FACING_ERRORS.OVERLOADED.message;
       suggestion = USER_FACING_ERRORS.OVERLOADED.suggestion;
@@ -1120,6 +1468,18 @@ async function handleRegenerate(
     return;
   }
 
+  // Get sampling branches count (default 1)
+  const samplingBranchCount = (message as any).samplingBranches || 1;
+  if (samplingBranchCount > 1) {
+    console.log(`[Regenerate] Sampling ${samplingBranchCount} response branches in parallel`);
+  }
+
+  // Build user context for content filter
+  const isResearcher = await db.userHasActiveGrantCapability(ws.userId, 'researcher');
+  const isAgeVerified = await db.isUserAgeVerified(ws.userId);
+  const isAdmin = await db.userHasActiveGrantCapability(ws.userId, 'admin');
+  const userContext: UserContext = { isResearcher, isAgeVerified, isAdmin };
+
   // Use conversation.userId (the owner) to fetch message
   const msg = await db.getMessage(message.messageId, message.conversationId, conversation.userId);
   if (!msg) {
@@ -1145,6 +1505,7 @@ async function handleRegenerate(
   console.log('Frontend parentBranchId:', message.parentBranchId?.slice(0, 8) || 'not provided');
   console.log('Original branch parent:', originalBranch?.parentBranchId?.slice(0, 8) || 'none');
   console.log('Using parentBranchId:', correctParentBranchId.slice(0, 8));
+  console.log('Sampling branches:', samplingBranchCount);
   
   Logger.debug('[Regenerate] Message:', message.messageId, 'Branch:', message.branchId);
   Logger.debug('[Regenerate] Original branch parent:', originalBranch?.parentBranchId);
@@ -1166,7 +1527,7 @@ async function handleRegenerate(
   }
 
   // Create new branch with correct parent and model
-  const updatedMessage = await db.addMessageBranch(
+  let updatedMessage = await db.addMessageBranch(
     message.messageId,
     message.conversationId,
     conversation.userId,
@@ -1174,7 +1535,12 @@ async function handleRegenerate(
     'assistant',
     correctParentBranchId,
     regenerateModel,
-    participantId
+    participantId,
+    undefined, // no attachments
+    ws.userId, // user who triggered the regeneration
+    undefined, // hiddenFromAi
+    false,     // preserveActiveBranch - select this new branch
+    'regeneration' // creationSource - this is a regeneration
   );
 
   if (!updatedMessage) {
@@ -1230,8 +1596,8 @@ async function handleRegenerate(
           maxTokens: participant.settings?.maxTokens ?? conversation.settings.maxTokens,
           topP: participant.settings?.topP ?? conversation.settings.topP,
           topK: participant.settings?.topK ?? conversation.settings.topK,
-          // Always use conversation-level thinking settings
-          thinking: conversation.settings.thinking,
+          // Use participant thinking settings if defined, otherwise fall back to conversation
+          thinking: participant.settings?.thinking ?? conversation.settings.thinking,
           // Include model-specific settings (e.g., image resolution)
           modelSpecific: participant.settings?.modelSpecific ?? conversation.settings.modelSpecific
         };
@@ -1280,7 +1646,8 @@ async function handleRegenerate(
       modelProvider: modelConfig.provider,
       modelSupportsPrefill: modelConfig.supportsPrefill,
       participantConversationMode: responderParticipant?.conversationMode,
-      existingSystemPrompt: responderSystemPrompt || ''
+      existingSystemPrompt: responderSystemPrompt || '',
+      cliModePrompt: conversation.cliModePrompt
     });
     
     // Create abort controller for this generation
@@ -1289,76 +1656,45 @@ async function handleRegenerate(
     // Track AI request in room manager for multi-user sync
     roomManager.startAiRequest(message.conversationId, ws.userId!, updatedMessage.id);
     
+    let generatedBranchIds: string[];
     try {
-    await inferenceService.streamCompletion(
-      modelConfig,
-      filteredHistoryMessages,
-      responderSystemPrompt || '',
-      responderSettings,
-      conversation.userId,
-      async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
-        const currentBranch = updatedMessage.branches.find(b => b.id === updatedMessage.activeBranchId);
-        if (currentBranch) {
-          currentBranch.content += chunk;
-          
-          // Store content blocks if provided
-          if (contentBlocks && contentBlocks.length > 0) {
-            currentBranch.contentBlocks = contentBlocks;
-          }
-            
-            // Trim whitespace on completion
-            if (isComplete) {
-              currentBranch.content = currentBranch.content.trim();
-          }
-          
-          // Save partial content periodically to prevent data loss
-          if (currentBranch.content.length % 500 === 0 || isComplete) {
-            await db.updateMessageContent(
-              updatedMessage.id,
-              updatedMessage.conversationId,
-              conversation.userId,
-              updatedMessage.activeBranchId,
-              currentBranch.content,
-              currentBranch.contentBlocks
-            );
-          }
-        }
-
-        const streamData = {
-          type: 'stream',
-          messageId: updatedMessage.id,
-          branchId: updatedMessage.activeBranchId,
-          content: chunk,
-          contentBlocks: contentBlocks,
-          isComplete
-        };
-        ws.send(JSON.stringify(streamData));
-        
-        // Broadcast to other users in the room
-        roomManager.broadcastToRoom(message.conversationId, streamData, ws);
-      },
-      conversation,
-      responderParticipant,
-      async (metrics) => {
-        // Store metrics in database
-        await db.addMetrics(conversation.id, conversation.userId, metrics);
-        
-        // Send metrics update to client
-        ws.send(JSON.stringify({
-          type: 'metrics_update',
-          conversationId: conversation.id,
-          metrics
-        }));
-      },
+      // Run parallel inference using shared utility
+      generatedBranchIds = await runParallelBranchInference({
+        ws,
+        db,
+        inferenceService,
+        conversation,
+        targetMessage: updatedMessage,
+        initialBranchId: updatedMessage.activeBranchId,
+        parentBranchId: correctParentBranchId,
+        samplingBranchCount,
+        modelConfig,
+        model: regenerateModel,
+        historyMessages: truncateForPersonaBudget(
+          filteredHistoryMessages,
+          responderParticipant?.personaContext,
+          responderSystemPrompt || '',
+          responderSettings?.maxTokens || 8192,
+          modelConfig.contextWindow || 200000,
+          responderParticipant?.name || 'unknown'
+        ),
+        systemPrompt: responderSystemPrompt || '',
+        settings: responderSettings,
         participants,
-        abortController.signal
-    );
+        responderParticipant,
+        participantId,
+        userContext,
+        abortSignal: abortController.signal,
+        creationSource: 'regeneration',
+        conversationId: message.conversationId,
+        personaContext: responderParticipant?.personaContext
+      });
     } finally {
       endGeneration(conversation.userId, conversation.id);
       roomManager.endAiRequest(message.conversationId);
     }
 
-    // Capture debug request/response for researchers
+    // Capture debug request/response for researchers (only for first branch)
     console.log('[DEBUG CAPTURE] Starting debug data capture for regenerate...');
     try {
       // Get the raw API request that was just sent
@@ -1366,17 +1702,18 @@ async function handleRegenerate(
       console.log(`[DEBUG CAPTURE] Raw request available: ${!!rawRequest}`);
 
       if (rawRequest) {
-        // Store debug data on the regenerated branch
-        const currentBranch = updatedMessage.branches.find(b => b.id === updatedMessage.activeBranchId);
-        console.log(`[DEBUG CAPTURE] Branch ${updatedMessage.activeBranchId}: branchObj found = ${!!currentBranch}`);
+        // Store debug data on the first regenerated branch
+        const firstBranchId = generatedBranchIds[0];
+        const currentBranch = updatedMessage.branches.find(b => b.id === firstBranchId);
+        console.log(`[DEBUG CAPTURE] Branch ${firstBranchId}: branchObj found = ${!!currentBranch}`);
 
         if (currentBranch) {
           // Get the participant for mode info
-          const responderParticipant = participants.find(p => p.id === participantId);
+          const responderParticipantForDebug = participants.find(p => p.id === participantId);
           
           // Compute actual format used (same logic as applyBackroomPromptIfNeeded)
-          const modelSupportsPrefill = modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true;
-          const participantMode = responderParticipant?.conversationMode;
+          const modelSupportsPrefill = modelConfig.supportsPrefill !== false && (modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true);
+          const participantMode = responderParticipantForDebug?.conversationMode;
           const wantsPrefill = !participantMode || participantMode === 'auto' || participantMode === 'prefill';
           const actualFormat = (conversation.format === 'prefill' && modelSupportsPrefill && wantsPrefill) ? 'prefill' : 'messages';
           
@@ -1398,17 +1735,17 @@ async function handleRegenerate(
             model: currentBranch.model
           };
 
-          console.log(`[DEBUG CAPTURE] Updating message branch ${updatedMessage.activeBranchId}...`);
+          console.log(`[DEBUG CAPTURE] Updating message branch ${firstBranchId}...`);
           await db.updateMessageBranch(
             updatedMessage.id,
             conversation.userId,
-            updatedMessage.activeBranchId,
+            firstBranchId,
             {
               debugRequest,
               debugResponse
             }
           );
-          console.log(`[DEBUG CAPTURE] Branch ${updatedMessage.activeBranchId} updated successfully`);
+          console.log(`[DEBUG CAPTURE] Branch ${firstBranchId} updated successfully`);
 
           // Send update to frontend so bug icon appears immediately
           const refreshedMessage = await db.getMessage(updatedMessage.id, conversation.id, conversation.userId);
@@ -1436,22 +1773,33 @@ async function handleRegenerate(
     // Check if this was an abort
     if (error instanceof Error && error.message === 'Generation aborted') {
       console.log(`[Abort] Regeneration was aborted for conversation ${message.conversationId}`);
-      ws.send(JSON.stringify({
-        type: 'stream',
-        messageId: updatedMessage.id,
-        branchId: updatedMessage.activeBranchId,
-        content: '',
-        isComplete: true,
-        aborted: true
-      }));
+      // Send abort notification for all branches on the message
+      for (const branch of updatedMessage.branches) {
+        ws.send(JSON.stringify({
+          type: 'stream',
+          messageId: updatedMessage.id,
+          branchId: branch.id,
+          content: '',
+          isComplete: true,
+          aborted: true
+        }));
+      }
       return;
     }
     
     console.error('Regeneration error:', error);
-    const errorMsg = error instanceof Error ? error.message : String(error);
+    let errorMsg = error instanceof Error ? error.message : String(error);
+    
+    // Extract meaningful error from Anthropic/API errors
+    // e.g., "400 {"type":"error","error":{"message":"You have reached..."}}"
+    const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
+    if (jsonMatch && jsonMatch[1]) {
+      errorMsg = jsonMatch[1];
+    }
+    
     ws.send(JSON.stringify({
       type: 'error',
-      error: errorMsg.length < 150 ? errorMsg : 'Failed to regenerate response'
+      error: errorMsg.length < 300 ? errorMsg : errorMsg.substring(0, 297) + '...'
     }));
   }
 }
@@ -1479,6 +1827,23 @@ async function handleEdit(
     return;
   }
 
+  // Content filter check with tiered moderation
+  const isResearcher = await db.userHasActiveGrantCapability(ws.userId, 'researcher');
+  const isAgeVerified = await db.isUserAgeVerified(ws.userId);
+  const isAdmin = await db.userHasActiveGrantCapability(ws.userId, 'admin');
+  const userContext: UserContext = { isResearcher, isAgeVerified, isAdmin };
+  
+  // Always check content - the filter applies tiered logic based on user context
+  const filterResult = await checkContent(message.content, userContext);
+  if (filterResult.blocked) {
+    ws.send(JSON.stringify({ 
+      type: 'content_blocked',
+      reason: filterResult.reason || 'Message blocked by content filter',
+      categories: filterResult.categories
+    }));
+    return;
+  }
+
   // Use conversation.userId (the owner) to fetch message
   const msg = await db.getMessage(message.messageId, message.conversationId, conversation.userId);
   if (!msg) {
@@ -1493,6 +1858,17 @@ async function handleEdit(
     return;
   }
 
+  const attachments = message.attachments !== undefined
+    ? message.attachments.map(att => ({
+        fileName: att.fileName,
+        fileType: att.fileType,
+        content: att.content,
+        fileSize: att.fileSize ?? Math.round(att.content.replace(/=+$/, '').length * 3 / 4),
+        mimeType: att.mimeType,
+        encoding: att.encoding
+      }))
+    : branch.attachments;
+
   // Create new branch with edited content
   // The parent should be the same as the original branch's parent (the previous message)
   const updatedMessage = await db.addMessageBranch(
@@ -1503,7 +1879,12 @@ async function handleEdit(
     branch.role,
     branch.parentBranchId, // Use the same parent as the original branch
     branch.model,
-    branch.participantId // Keep the same participant
+    branch.participantId, // Keep the same participant
+    attachments,
+    ws.userId, // user who made the edit
+    undefined, // hiddenFromAi
+    false,     // preserveActiveBranch - select this new branch
+    'human_edit' // creationSource - human edited this message
   );
 
   if (!updatedMessage) {
@@ -1520,8 +1901,20 @@ async function handleEdit(
   // Broadcast to other users in the room
   roomManager.broadcastToRoom(message.conversationId, userEditEvent, ws);
 
-  // If this was a user message, automatically generate an assistant response
-  if (branch.role === 'user') {
+  // If this was a user message, automatically generate an assistant response (unless skipped)
+  if (branch.role === 'user' && !message.skipRegeneration) {
+    // Get sampling branches count (default 1)
+    const samplingBranchCount = (message as any).samplingBranches || 1;
+    if (samplingBranchCount > 1) {
+      console.log(`[Edit] Sampling ${samplingBranchCount} response branches in parallel`);
+    }
+    
+    // Build user context for content filter
+    const isResearcher = await db.userHasActiveGrantCapability(ws.userId, 'researcher');
+    const isAgeVerified = await db.isUserAgeVerified(ws.userId);
+    const isAdmin = await db.userHasActiveGrantCapability(ws.userId, 'admin');
+    const userContext: UserContext = { isResearcher, isAgeVerified, isAdmin };
+    
     // Get all messages to find the position of the edited message
     const allMessages = await db.getConversationMessages(msg.conversationId, ws.userId);
     const editedMessageIndex = allMessages.findIndex(m => m.id === msg.id);
@@ -1574,7 +1967,12 @@ async function handleEdit(
         'assistant',
         updatedMessage.activeBranchId, // Parent is the edited user message's active branch
         responderModel,  // Use responder's model, not conversation model
-        responderId // Assistant participant ID
+        responderId, // Assistant participant ID
+        undefined, // no attachments
+        ws.userId, // user who triggered the generation
+        undefined, // hiddenFromAi
+        false,     // preserveActiveBranch - select this new branch
+        'inference' // creationSource - AI generated after user edit
       );
       
       if (!newBranch) {
@@ -1603,7 +2001,11 @@ async function handleEdit(
         'assistant',
         responderModel,  // Use responder's model, not conversation model
         updatedMessage.activeBranchId, // Parent is the edited user message's active branch
-        responderId // Assistant participant ID
+        responderId, // Assistant participant ID
+        undefined,   // no attachments
+        ws.userId,   // user who triggered the generation
+        undefined,   // hiddenFromAi
+        'inference'  // creationSource - AI generated after user edit
       );
       
       // Send assistant message to frontend
@@ -1648,8 +2050,8 @@ async function handleEdit(
             maxTokens: responderParticipant.settings?.maxTokens ?? conversation.settings.maxTokens,
             topP: responderParticipant.settings?.topP ?? conversation.settings.topP,
             topK: responderParticipant.settings?.topK ?? conversation.settings.topK,
-            // Always use conversation-level thinking settings
-            thinking: conversation.settings.thinking,
+            // Use participant thinking settings if defined, otherwise fall back to conversation
+            thinking: responderParticipant.settings?.thinking ?? conversation.settings.thinking,
             // Include model-specific settings (e.g., image resolution)
             modelSpecific: responderParticipant.settings?.modelSpecific ?? conversation.settings.modelSpecific
           };
@@ -1699,71 +2101,53 @@ async function handleEdit(
         modelProvider: modelConfig.provider,
         modelSupportsPrefill: modelConfig.supportsPrefill,
         participantConversationMode: responderParticipantEdit?.conversationMode,
-        existingSystemPrompt: responderSystemPrompt || ''
+        existingSystemPrompt: responderSystemPrompt || '',
+        cliModePrompt: conversation.cliModePrompt
       });
       
-      await inferenceService.streamCompletion(
-        modelConfig,
-        filteredHistoryMessages,
-        responderSystemPrompt || '',
-        responderSettings,
-        conversation.userId,
-        async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
-          const currentBranch = targetMessage.branches.find(b => b.id === targetBranchId);
-          if (currentBranch) {
-            currentBranch.content += chunk;
-            
-            // Store content blocks if provided
-            if (contentBlocks && contentBlocks.length > 0) {
-              currentBranch.contentBlocks = contentBlocks;
-            }
-            
-            // Trim whitespace on completion
-            if (isComplete) {
-              currentBranch.content = currentBranch.content.trim();
-            }
-            
-            // Save partial content periodically
-            if (currentBranch.content.length % 500 === 0 || isComplete) {
-              await db.updateMessageContent(
-                targetMessage.id,
-                targetMessage.conversationId,
-                conversation.userId!,
-                targetBranchId,
-                currentBranch.content,
-                currentBranch.contentBlocks
-              );
-            }
-          }
-
-          const streamData = {
-            type: 'stream',
-            messageId: targetMessage.id,
-            branchId: targetBranchId,
-            content: chunk,
-            contentBlocks: contentBlocks,
-            isComplete
-          };
-          ws.send(JSON.stringify(streamData));
-          
-          // Broadcast to other users
-          roomManager.broadcastToRoom(message.conversationId, streamData, ws);
-        },
-        conversation,
-        responderParticipant,
-        async (metrics) => {
-          // Store metrics in database
-          await db.addMetrics(conversation.id, conversation.userId, metrics);
-          
-          // Send metrics update to client
-          ws.send(JSON.stringify({
-            type: 'metrics_update',
-            conversationId: conversation.id,
-            metrics
-          }));
-        },
-        participants
-      );
+      // Create abort controller for this generation
+      const abortController = startGeneration(conversation.userId, conversation.id);
+      
+      // Track AI request in room manager for multi-user sync
+      roomManager.startAiRequest(message.conversationId, ws.userId!, targetMessage.id);
+      
+      let generatedBranchIds: string[];
+      try {
+        // Run parallel inference using shared utility
+        generatedBranchIds = await runParallelBranchInference({
+          ws,
+          db,
+          inferenceService,
+          conversation,
+          targetMessage,
+          initialBranchId: targetBranchId,
+          parentBranchId: updatedMessage.activeBranchId, // Parent is the edited user message
+          samplingBranchCount,
+          modelConfig,
+          model: responderModel,
+          historyMessages: truncateForPersonaBudget(
+            filteredHistoryMessages,
+            responderParticipant?.personaContext,
+            responderSystemPrompt || '',
+            responderSettings?.maxTokens || 8192,
+            modelConfig.contextWindow || 200000,
+            responderParticipant?.name || 'unknown'
+          ),
+          systemPrompt: responderSystemPrompt || '',
+          settings: responderSettings,
+          participants,
+          responderParticipant,
+          participantId: responderId,
+          userContext,
+          abortSignal: abortController.signal,
+          creationSource: 'inference',
+          conversationId: message.conversationId,
+          personaContext: responderParticipant?.personaContext
+        });
+      } finally {
+        endGeneration(conversation.userId, conversation.id);
+        roomManager.endAiRequest(message.conversationId);
+      }
       
       // Capture debug request/response for researchers
       console.log('[DEBUG CAPTURE] Starting debug data capture for edit...');
@@ -1772,10 +2156,11 @@ async function handleEdit(
         console.log(`[DEBUG CAPTURE] Raw request available for edit: ${!!rawRequest}`);
 
         if (rawRequest && targetMessage) {
-          const currentBranch = targetMessage.branches.find(b => b.id === targetBranchId);
+          const firstBranchId = generatedBranchIds[0];
+          const currentBranch = targetMessage.branches.find(b => b.id === firstBranchId);
           if (currentBranch) {
             // Compute actual format used
-            const modelSupportsPrefill = modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true;
+            const modelSupportsPrefill = modelConfig.supportsPrefill !== false && (modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true);
             const participantMode = responderParticipantEdit?.conversationMode;
             const wantsPrefill = !participantMode || participantMode === 'auto' || participantMode === 'prefill';
             const actualFormat = (conversation.format === 'prefill' && modelSupportsPrefill && wantsPrefill) ? 'prefill' : 'messages';
@@ -1798,10 +2183,10 @@ async function handleEdit(
             await db.updateMessageBranch(
               targetMessage.id,
               conversation.userId,
-              targetBranchId,
+              firstBranchId,
               { debugRequest, debugResponse }
             );
-            console.log(`[DEBUG CAPTURE] Edit branch ${targetBranchId} updated successfully`);
+            console.log(`[DEBUG CAPTURE] Edit branch ${firstBranchId} updated successfully`);
 
             // Send update to frontend
             const refreshedMessage = await db.getMessage(targetMessage.id, conversation.id, conversation.userId);
@@ -1816,10 +2201,17 @@ async function handleEdit(
       }
     } catch (error) {
       console.error('Error generating response to edited message:', error);
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      let errorMsg = error instanceof Error ? error.message : String(error);
+      
+      // Extract meaningful error from Anthropic/API errors
+      const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
+      if (jsonMatch && jsonMatch[1]) {
+        errorMsg = jsonMatch[1];
+      }
+      
       ws.send(JSON.stringify({
         type: 'error',
-        error: errorMsg.length < 150 ? errorMsg : 'Failed to generate response'
+        error: errorMsg.length < 300 ? errorMsg : errorMsg.substring(0, 297) + '...'
       }));
     }
   }
@@ -1848,7 +2240,7 @@ async function handleDelete(
     }
     
     // Delete the message branch and all its descendants
-    const deleted = await db.deleteMessageBranch(messageId, conversationId, conversation.userId, branchId);
+    const deleted = await db.deleteMessageBranch(messageId, conversationId, conversation.userId, branchId, ws.userId);
     
     if (deleted) {
       const deleteEvent = {
@@ -1903,6 +2295,12 @@ async function handleContinue(
       return;
     }
 
+    // Build user context for content filter
+    const isResearcher = await db.userHasActiveGrantCapability(ws.userId, 'researcher');
+    const isAgeVerified = await db.isUserAgeVerified(ws.userId);
+    const isAdmin = await db.userHasActiveGrantCapability(ws.userId, 'admin');
+    const userContext: UserContext = { isResearcher, isAgeVerified, isAdmin };
+
     // Get participants
     const participants = await db.getConversationParticipants(conversationId, conversation.userId);
     
@@ -1956,7 +2354,11 @@ async function handleContinue(
           parentBranchId,
           responderModelId,
           responder.id,
-          undefined // no attachments
+          undefined, // no attachments
+          ws.userId, // user who triggered the generation
+          undefined, // hiddenFromAi
+          false,     // preserveActiveBranch - select this new branch
+          'inference' // creationSource - AI generated (continue)
         );
       } else {
         // No siblings exist yet, create a new message
@@ -1968,7 +2370,11 @@ async function handleContinue(
           'assistant',
           responderModelId,
           parentBranchId,
-          responder.id
+          responder.id,
+          undefined, // no attachments
+          ws.userId, // user who triggered the generation
+          undefined, // hiddenFromAi
+          'inference' // creationSource - AI generated (continue)
         );
       }
     } else {
@@ -1980,7 +2386,11 @@ async function handleContinue(
         'assistant',
         responderModelId,
         undefined,
-        responder.id
+        responder.id,
+        undefined, // no attachments
+        ws.userId, // user who triggered the generation
+        undefined, // hiddenFromAi
+        'inference' // creationSource - AI generated (continue)
       );
     }
 
@@ -2071,39 +2481,6 @@ async function handleContinue(
             modelSpecific: responder.settings?.modelSpecific ?? conversation.settings?.modelSpecific
         };
     
-    try {
-    // Prepare all branches for parallel sampling
-    const branchesToGenerate: Array<{ branchId: string; branchContent: string }> = [
-      { branchId: assistantBranch.id, branchContent: '' }
-    ];
-    
-    // Create additional branches if sampling multiple responses
-    if (samplingBranchCount > 1) {
-      for (let i = 1; i < samplingBranchCount; i++) {
-        const newBranchMessage = await db.addMessageBranch(
-          assistantMessage.id,
-          assistantMessage.conversationId,
-          conversation.userId,
-          '',
-          'assistant',
-          parentBranchId,
-          responder.model || conversation.model,
-          responder.id,
-          undefined
-        );
-        
-        if (newBranchMessage) {
-          const newBranch = newBranchMessage.branches[newBranchMessage.branches.length - 1];
-          branchesToGenerate.push({ branchId: newBranch.id, branchContent: '' });
-          assistantMessage.branches.push(newBranch);
-          
-          ws.send(JSON.stringify({ type: 'message_edited', message: assistantMessage }));
-          roomManager.broadcastToRoom(conversationId, { type: 'message_edited', message: assistantMessage, fromUserId: ws.userId }, ws);
-        }
-      }
-      console.log(`[Continue] Created ${branchesToGenerate.length} branches for parallel sampling`);
-    }
-    
     // Determine system prompt with backroom logic for early group chats
     const continueSystemPrompt = applyBackroomPromptIfNeeded({
       conversationFormat: conversation.format,
@@ -2111,94 +2488,62 @@ async function handleContinue(
       modelProvider: modelConfig.provider,
       modelSupportsPrefill: modelConfig.supportsPrefill,
       participantConversationMode: responder.conversationMode,
-      existingSystemPrompt: responder.systemPrompt || conversation.systemPrompt || ''
+      existingSystemPrompt: responder.systemPrompt || conversation.systemPrompt || '',
+      cliModePrompt: conversation.cliModePrompt
     });
     
-    // Helper function to run inference for a single branch
-    const runBranchInference = async (branchId: string, branchIndex: number) => {
-      let branchContent = '';
-      
-      await inferenceService.streamCompletion(
-        modelConfig,
-        messagesWithNewAssistant,
-        continueSystemPrompt,
-        inferenceSettings,
-      ws.userId!,
-      async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
-          branchContent += chunk;
-        
-          const currentBranch = assistantMessage.branches.find((b: any) => b.id === branchId);
-          if (currentBranch) {
-            currentBranch.content = branchContent;
-        if (contentBlocks && contentBlocks.length > 0) {
-              currentBranch.contentBlocks = contentBlocks;
-            }
-            if (isComplete) {
-              currentBranch.content = branchContent.trim();
-            }
-            if (branchContent.length % 500 === 0 || isComplete) {
-              await db.updateMessageContent(assistantMessage.id, conversationId, conversation.userId, branchId, currentBranch.content, currentBranch.contentBlocks);
-            }
-          }
-          
-          const streamData = {
-          type: 'stream',
-          messageId: assistantMessage.id,
-            branchId: branchId,
-          content: chunk,
-          contentBlocks: contentBlocks,
-            isComplete,
-            branchIndex
-          };
-          ws.send(JSON.stringify(streamData));
-          roomManager.broadcastToRoom(conversationId, streamData, ws);
-
-        if (isComplete) {
-            const finalBranch = assistantMessage.branches.find((b: any) => b.id === branchId);
-            if (finalBranch) {
-              await db.updateMessageContent(assistantMessage.id, conversationId, conversation.userId, branchId, finalBranch.content, finalBranch.contentBlocks);
-          }
-        }
-      },
-      conversation,
-      responder,
-      async (metrics) => {
-          if (branchIndex === 0) {
-        await db.addMetrics(conversation.id, conversation.userId, metrics);
-            ws.send(JSON.stringify({ type: 'metrics_update', conversationId: conversation.id, metrics, branchIndex }));
-          }
-        },
-        participants,
-        abortController.signal
-      );
-    };
-    
-    // Run all branches in parallel
-    await Promise.all(
-      branchesToGenerate.map((branch, index) => runBranchInference(branch.branchId, index))
-    );
-    
-    // Capture debug request/response for researchers
-    console.log('[DEBUG CAPTURE] Starting debug data capture for continue...');
+    let generatedBranchIds: string[];
     try {
-      const rawRequest = baseInferenceService.lastRawRequest;
-      console.log(`[DEBUG CAPTURE] Raw request available: ${!!rawRequest}`);
+      // Run parallel inference using shared utility
+      generatedBranchIds = await runParallelBranchInference({
+        ws,
+        db,
+        inferenceService,
+        conversation,
+        targetMessage: assistantMessage,
+        initialBranchId: assistantBranch.id,
+        parentBranchId: parentBranchId || 'root',
+        samplingBranchCount,
+        modelConfig,
+        model: responder.model || conversation.model,
+        historyMessages: truncateForPersonaBudget(
+          messagesWithNewAssistant,
+          responder.personaContext,
+          continueSystemPrompt,
+          inferenceSettings.maxTokens || 8192,
+          modelConfig.contextWindow || 200000,
+          responder.name
+        ),
+        systemPrompt: continueSystemPrompt,
+        settings: inferenceSettings,
+        participants,
+        responderParticipant: responder,
+        participantId: responder.id,
+        userContext,
+        abortSignal: abortController.signal,
+        creationSource: 'inference',
+        conversationId,
+        personaContext: responder.personaContext
+      });
       
-      if (rawRequest) {
-        // Compute actual format used (same logic as applyBackroomPromptIfNeeded)
-        const modelSupportsPrefill = modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true;
-        const participantMode = responder.conversationMode;
-        const wantsPrefill = !participantMode || participantMode === 'auto' || participantMode === 'prefill';
-        const actualFormat = (conversation.format === 'prefill' && modelSupportsPrefill && wantsPrefill) ? 'prefill' : 'messages';
-        
-        for (const branch of branchesToGenerate) {
-          const branchObj = assistantMessage.branches.find((b: any) => b.id === branch.branchId);
+      // DEBUG CAPTURE: Capture debug data for the first branch after completion
+      try {
+        const rawRequest = baseInferenceService.lastRawRequest;
+        if (rawRequest && generatedBranchIds.length > 0) {
+          const firstBranchId = generatedBranchIds[0];
+          const branchObj = assistantMessage.branches.find((b: any) => b.id === firstBranchId);
           if (branchObj) {
+            console.log(`[DEBUG CAPTURE] Continue: Capturing debug data for branch ${firstBranchId.substring(0, 8)}...`);
+            
+            const modelSupportsPrefill = modelConfig.supportsPrefill !== false && (modelConfig.provider === 'anthropic' || modelConfig.provider === 'bedrock' || modelConfig.supportsPrefill === true);
+            const participantMode = responder.conversationMode;
+            const wantsPrefill = !participantMode || participantMode === 'auto' || participantMode === 'prefill';
+            const actualFormat = (conversation.format === 'prefill' && modelSupportsPrefill && wantsPrefill) ? 'prefill' : 'messages';
+            
             const debugRequest = {
               ...rawRequest,
               provider: modelConfig.provider,
               settings: inferenceSettings,
-              // Inference format metadata
               conversationFormat: conversation.format,
               participantConversationMode: participantMode || 'auto',
               actualFormatUsed: actualFormat
@@ -2210,15 +2555,9 @@ async function handleContinue(
               model: branchObj.model
             };
             
-            await db.updateMessageBranch(
-              assistantMessage.id,
-              conversation.userId,
-              branch.branchId,
-              { debugRequest, debugResponse }
-            );
-            console.log(`[DEBUG CAPTURE] Continue branch ${branch.branchId} updated`);
+            await db.updateMessageBranch(assistantMessage.id, conversation.userId, firstBranchId, { debugRequest, debugResponse });
+            console.log(`[DEBUG CAPTURE] Continue: Debug data saved for branch ${firstBranchId.substring(0, 8)}`);
             
-            // Send update to frontend so bug icon appears immediately
             const refreshedMessage = await db.getMessage(assistantMessage.id, conversationId, conversation.userId);
             if (refreshedMessage) {
               ws.send(JSON.stringify({ type: 'message_edited', message: refreshedMessage }));
@@ -2226,11 +2565,9 @@ async function handleContinue(
             }
           }
         }
-        console.log('[DEBUG CAPTURE] Debug data capture complete for continue');
+      } catch (debugError) {
+        console.error('[DEBUG CAPTURE] Continue: Failed to capture debug data:', debugError);
       }
-    } catch (debugError) {
-      console.error('[DEBUG CAPTURE] Failed to capture debug data for continue:', debugError);
-    }
     
     // Send updated conversation after all complete
     const updatedConversation = await db.getConversation(conversationId, conversation.userId);
@@ -2262,15 +2599,23 @@ async function handleContinue(
     }
     
     console.error('Continue generation error:', error);
+    let errorMsg = error instanceof Error ? error.message : String(error);
+    
+    // Extract meaningful error from Anthropic/API errors
+    const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
+    if (jsonMatch && jsonMatch[1]) {
+      errorMsg = jsonMatch[1];
+    }
+    
     ws.send(JSON.stringify({ 
       type: 'error', 
-      error: error instanceof Error ? error.message : 'Failed to continue generation'
+      error: errorMsg.length < 300 ? errorMsg : errorMsg.substring(0, 297) + '...'
     }));
   }
 }
 
 // Heartbeat interval to keep connections alive
+// Runs every 30 seconds, terminates connections that don't respond to ping
 setInterval(() => {
-  // This would need to be implemented with a WebSocket server instance
-  // to track all connections
+  roomManager.performHeartbeat();
 }, 30000);

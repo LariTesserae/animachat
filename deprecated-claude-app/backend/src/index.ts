@@ -1,4 +1,12 @@
+// Load .env before any other import executes. Several modules (e.g.
+// middleware/auth.ts reading JWT_SECRET) validate environment variables at
+// module scope, which runs during import resolution — before the
+// dotenv.config() call further down in this file. Without this first-line
+// side-effect import, a JWT_SECRET that lives only in .env is invisible at
+// that point and startup fails.
+import 'dotenv/config';
 import express from 'express';
+import compression from 'compression';
 import { clearOpenRouterLog } from './utils/openrouterLogger.js';
 
 // Clean up old OpenRouter request logs on startup
@@ -27,15 +35,25 @@ import { adminRouter } from './routes/admin.js';
 import { collaborationRouter } from './routes/collaboration.js';
 import { personaRouter } from './routes/personas.js';
 import avatarRouter from './routes/avatars.js';
+import blobRouter from './routes/blobs.js';
+import siteConfigRouter from './routes/site-config.js';
 import { websocketHandler } from './websocket/handler.js';
 import { Database } from './database/index.js';
+import { initBlobStore } from './database/blob-store.js';
 import { authenticateToken } from './middleware/auth.js';
 import { OpenRouterService } from './services/openrouter.js';
-import { updateOpenRouterModelsCache } from './services/pricing-cache.js';
+import { updateOpenRouterModelsCache, setOpenRouterRefreshCallback } from './services/pricing-cache.js';
 
 dotenv.config();
 
 const app = express();
+
+// Honor X-Forwarded-For from the local nginx so `req.ip` is the real
+// client IP. Required for per-IP rate limiting to be meaningful — without
+// this, every request looks like it comes from the loopback nginx.
+// `'loopback'` is the safe choice: trust only the nginx running on the
+// same host, never accept the header from a public-internet client.
+app.set('trust proxy', 'loopback');
 
 // Initialize database
 const db = new Database();
@@ -78,9 +96,47 @@ if (USE_HTTPS) {
   server = createHttpServer(app);
 }
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  // Accept the arc-auth subprotocol for token-based authentication
+  handleProtocols(protocols) {
+    if (protocols.has('arc-auth')) return 'arc-auth';
+    return false;
+  },
+  // Enable per-message deflate compression for large messages
+  perMessageDeflate: {
+    zlibDeflateOptions: {
+      // Use maximum compression level for slow connections
+      level: 6, // 1-9, higher = more compression but slower
+    },
+    zlibInflateOptions: {
+      chunkSize: 10 * 1024
+    },
+    // Compress messages larger than 1KB
+    threshold: 1024,
+    // Don't limit concurrent decompression
+    concurrencyLimit: 10,
+  }
+});
+console.log('[WebSocket] Per-message deflate compression enabled (threshold: 1KB)');
 
 // Middleware
+// Enable gzip/deflate compression for HTTP responses
+app.use(compression({
+  // Compress responses larger than 1KB
+  threshold: 1024,
+  // Compression level (1-9, higher = more compression)
+  level: 6,
+  // Don't compress if client doesn't support it
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  }
+}));
+console.log('[HTTP] Gzip compression enabled (threshold: 1KB)');
+
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true
@@ -105,11 +161,44 @@ app.use('/api/admin', adminRouter(db));
 app.use('/api/collaboration', collaborationRouter(db));
 app.use('/api/personas', authenticateToken, personaRouter(db));
 app.use('/api/avatars', authenticateToken, avatarRouter);
+app.use('/api/blobs', blobRouter); // No auth - blobs are served by ID (content-addressed)
 app.use('/api/system', systemRouter());
+app.use('/api/site-config', siteConfigRouter); // No auth - public site configuration
 
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Analytics endpoint for stuck generation debugging
+app.post('/api/analytics/stuck-generation', authenticateToken, (req: any, res) => {
+  try {
+    const data = req.body;
+    const userId = req.userId;
+    
+    // Log the stuck generation report
+    console.log('=== STUCK GENERATION REPORT ===');
+    console.log('User ID:', userId);
+    console.log('Timestamp:', data.timestamp);
+    console.log('Streaming started:', data.streamingStartTime);
+    console.log('Elapsed (ms):', data.elapsedMs);
+    console.log('Conversation ID:', data.conversationId);
+    console.log('Streaming Message ID:', data.streamingMessageId);
+    console.log('First token received:', data.firstTokenReceived);
+    console.log('WebSocket connected:', data.wsConnected);
+    console.log('User Agent:', data.userAgent);
+    console.log('URL:', data.currentUrl);
+    console.log('Console logs (last 100):');
+    if (data.consoleLogs && Array.isArray(data.consoleLogs)) {
+      data.consoleLogs.forEach((log: string) => console.log('  ', log));
+    }
+    console.log('=== END STUCK GENERATION REPORT ===');
+    
+    res.json({ success: true, message: 'Report received' });
+  } catch (error) {
+    console.error('Error processing stuck generation report:', error);
+    res.status(500).json({ error: 'Failed to process report' });
+  }
 });
 
 // WebSocket handling
@@ -123,22 +212,33 @@ async function startServer() {
     // Initialize database
     await db.init();
     console.log('Database initialized');
+
+    // Initialize blob storage for images
+    await initBlobStore();
+    console.log('BlobStore initialized');
     
     // Initialize ModelLoader with database
     const modelLoader = ModelLoader.getInstance();
     modelLoader.setDatabase(db);
     console.log('ModelLoader initialized with database');
     
-    // Pre-populate OpenRouter pricing cache
+    // Pre-populate OpenRouter pricing cache and register lazy refresh callback
+    const openRouterService = new OpenRouterService(db);
+    
+    // Register refresh callback for lazy loading if cache is empty
+    setOpenRouterRefreshCallback(async () => {
+      const models = await openRouterService.listModels();
+      updateOpenRouterModelsCache(models);
+    });
+    
     try {
       console.log('Pre-populating OpenRouter pricing cache...');
-      const openRouterService = new OpenRouterService(db);
       const openRouterModels = await openRouterService.listModels();
       updateOpenRouterModelsCache(openRouterModels);
       console.log(`✅ OpenRouter pricing cache ready with ${openRouterModels.length} models`);
     } catch (error: any) {
       console.error('⚠️ PRICING WARNING: Failed to pre-populate OpenRouter pricing cache.');
-      console.error('   OpenRouter models will show $0 cost until the cache is populated.');
+      console.error('   OpenRouter models will be fetched on-demand when needed.');
       console.error('   This usually means OPENROUTER_API_KEY is not set or invalid.');
       console.error('   Error:', error?.message || error);
     }

@@ -1,5 +1,6 @@
 import { Message, ContextManagement } from '@deprecated-claude/shared';
 import { Logger } from '../utils/logger.js';
+import { isImageFile } from './attachment-utils.js';
 
 export interface CacheMarker {
   messageId: string;
@@ -41,10 +42,7 @@ function estimateTokens(content: string): number {
 }
 
 function isImageAttachment(fileName?: string): boolean {
-  if (!fileName) return false;
-  const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'];
-  const ext = fileName.split('.').pop()?.toLowerCase() || '';
-  return imageExtensions.includes(ext);
+  return isImageFile(fileName);
 }
 
 function getMessageTokens(message: Message): number {

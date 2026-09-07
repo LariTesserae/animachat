@@ -40,7 +40,7 @@ export class OpenAICompatibleService {
       // Apply model prefix if configured
       const actualModelId = this.modelPrefix ? `${this.modelPrefix}${modelId}` : modelId;
       
-      const requestBody = {
+      const requestBody: any = {
         model: actualModelId,
         messages: openAIMessages,
         stream: true,
@@ -50,6 +50,12 @@ export class OpenAICompatibleService {
         ...(settings.topK !== undefined && { top_k: settings.topK }),
         ...(stopSequences && stopSequences.length > 0 && { stop: stopSequences })
       };
+
+      // OpenAI reasoning_effort (low/medium/high) for reasoning models
+      const reasoningEffort = settings.modelSpecific?.reasoningEffort;
+      if (typeof reasoningEffort === 'string') {
+        requestBody.reasoning_effort = reasoningEffort;
+      }
 
       // Log the request
       await llmLogger.logRequest({
@@ -74,8 +80,8 @@ export class OpenAICompatibleService {
       
       console.log(`[OpenAI-Compatible] Making request to: ${endpoint}`);
       if (process.env.LOG_DEBUG === 'true') {
-      console.log(`[OpenAI-Compatible] Model: ${actualModelId}`);
-      console.log(`[OpenAI-Compatible] Request body:`, JSON.stringify(requestBody, null, 2));
+        console.log(`[OpenAI-Compatible] Model: ${actualModelId}`);
+        console.log(`[OpenAI-Compatible] Request body keys:`, Object.keys(requestBody));
       }
 
       const response = await fetch(endpoint, {
@@ -106,6 +112,16 @@ export class OpenAICompatibleService {
 
       let fullContent = '';
 
+      // Track native reasoning/thinking emitted as a separate streaming field.
+      // vLLM (and other OpenAI-compatible servers with a reasoning parser) emit
+      // chain-of-thought in `delta.reasoning` / `delta.reasoning_content` with
+      // `delta.content` null until the reasoning phase ends — distinct from
+      // models that inline <think>...</think> in content (handled at [DONE] via
+      // parseThinkingTags). Mirrors the OpenRouter service's reasoning handling.
+      const reasoningBlocks: any[] = [];
+      let reasoningContent = '';
+      let hasReasoningStarted = false;
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -118,20 +134,47 @@ export class OpenAICompatibleService {
           if (line.startsWith('data: ')) {
             const data = line.slice(6);
             if (data === '[DONE]') {
-              // Parse thinking tags from full content and create contentBlocks
-              const contentBlocks = this.parseThinkingTags(fullContent);
+              // Merge any streamed native-reasoning block with inline <think>
+              // tags parsed from the final text content. Native reasoning (if
+              // present) stays at index 0; inline-tag blocks are appended.
+              const inlineBlocks = this.parseThinkingTags(fullContent);
+              const contentBlocks = [...reasoningBlocks, ...inlineBlocks];
+              if (hasReasoningStarted) {
+                console.log(`[OpenAI-Compatible] 🧠 Reasoning complete: ${reasoningContent.length} chars`);
+              }
               await onChunk('', true, contentBlocks.length > 0 ? contentBlocks : undefined);
               break;
             }
 
             try {
               const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              
+              const delta = parsed.choices?.[0]?.delta;
+
+              // Native reasoning passthrough: prefer reasoning_content (string),
+              // fall back to reasoning (string). vLLM uses these for CoT.
+              let reasoningText = '';
+              if (delta?.reasoning_content && typeof delta.reasoning_content === 'string') {
+                reasoningText = delta.reasoning_content;
+              } else if (delta?.reasoning && typeof delta.reasoning === 'string') {
+                reasoningText = delta.reasoning;
+              }
+              if (reasoningText) {
+                if (!hasReasoningStarted) {
+                  hasReasoningStarted = true;
+                  reasoningBlocks.unshift({ type: 'thinking', thinking: '' });
+                  console.log('[OpenAI-Compatible] 🧠 Reasoning block started');
+                }
+                reasoningContent += reasoningText;
+                reasoningBlocks[0] = { type: 'thinking', thinking: reasoningContent };
+                await onChunk('', false, reasoningBlocks);
+              }
+
+              const content = delta?.content;
+
               if (content) {
                 chunks.push(content);
                 fullContent += content;
-                await onChunk(content, false);
+                await onChunk(content, false, reasoningBlocks.length > 0 ? reasoningBlocks : undefined);
               }
 
               // Check if we have usage data

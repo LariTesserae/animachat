@@ -1,12 +1,17 @@
 import { Router } from 'express';
 import { Database } from '../database/index.js';
 import { authenticateToken, AuthRequest } from '../middleware/auth.js';
+import { tokenLookupLimiter } from '../middleware/rate-limit.js';
 import { z } from 'zod';
 import crypto from 'crypto';
 
 function generateInviteCode(): string {
-  // Generate a random 8-character alphanumeric code
-  return crypto.randomBytes(4).toString('hex');
+  // 16 bytes = 32 hex chars = 128 bits of entropy. Treat as a capability
+  // token — each invite is literally credit. Previously 8 hex chars (32 bits),
+  // which is brute-forceable from a public oracle in hours. Older codes still
+  // validate (lookup is by string match), but new codes from now on are full
+  // entropy.
+  return crypto.randomBytes(16).toString('hex');
 }
 
 export function createInvitesRouter(db: Database): Router {
@@ -30,7 +35,8 @@ export function createInvitesRouter(db: Database): Router {
         code: z.string().min(1).max(50).optional(),
         amount: z.number().positive(),
         currency: z.string().min(1).max(50).default('credit'),
-        expiresInDays: z.number().positive().optional()
+        expiresInDays: z.number().positive().optional(),
+        maxUses: z.number().positive().optional() // undefined = unlimited uses
       });
 
       const data = schema.parse(req.body);
@@ -50,7 +56,8 @@ export function createInvitesRouter(db: Database): Router {
         req.userId,
         data.amount,
         data.currency,
-        expiresAt
+        expiresAt,
+        data.maxUses
       );
 
       res.json({
@@ -58,6 +65,8 @@ export function createInvitesRouter(db: Database): Router {
         amount: invite.amount,
         currency: invite.currency,
         expiresAt: invite.expiresAt,
+        maxUses: invite.maxUses,
+        useCount: invite.useCount ?? 0,
         createdAt: invite.createdAt
       });
     } catch (error) {
@@ -84,8 +93,11 @@ export function createInvitesRouter(db: Database): Router {
     }
   });
 
-  // Check if an invite code is valid (public endpoint for UI validation)
-  router.get('/:code/check', async (req, res) => {
+  // Check if an invite code is valid (public endpoint for UI validation).
+  // Rate-limited because this is a public oracle: combined with the (now-
+  // fixed-but-historically-low) entropy of invite codes, an unthrottled
+  // version was the brute-force-credits vector.
+  router.get('/:code/check', tokenLookupLimiter, async (req, res) => {
     try {
       const { code } = req.params;
       const validation = db.validateInvite(code);

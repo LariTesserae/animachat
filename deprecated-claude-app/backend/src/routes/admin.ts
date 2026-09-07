@@ -395,6 +395,191 @@ export function adminRouter(db: Database): Router {
     }
   });
 
+  // ---- Census: add models from the model census beacon ------------------
+  // The census (a separate service) publishes every model it can see, with
+  // per-provider "doors" and a probe verdict. This panel diffs that list
+  // against the models this app already serves and lets an admin add the
+  // missing ones as system models (written to models.local.json, which a
+  // deploy does not overwrite).
+  const CENSUS_URL = process.env.CENSUS_BEACON_URL ||
+    'https://census-production-e5bd.up.railway.app/api/v2/models.json';
+  const CENSUS_SOURCE_TO_PROVIDER: Record<string, string> = {
+    anthropic_direct: 'anthropic',
+    openrouter: 'openrouter',
+    bedrock_foundation_models: 'bedrock',
+  };
+  let censusCache: { at: number; data: any } | null = null;
+
+  async function fetchCensus(): Promise<any> {
+    if (censusCache && Date.now() - censusCache.at < 10 * 60 * 1000) return censusCache.data;
+    const r = await fetch(CENSUS_URL, { headers: { 'User-Agent': 'arc-chat-admin/1' } });
+    if (!r.ok) throw new Error(`census beacon ${r.status}`);
+    const data = await r.json();
+    censusCache = { at: Date.now(), data };
+    return data;
+  }
+
+  const slug = (s: string) => s.toLowerCase().replace(/^anthropic\//, '').replace(/[^a-z0-9.]+/g, '-').replace(/^-+|-+$/g, '');
+  const stripRegion = (s: string) => s.replace(/^(us|eu|apac|global)\./, '');
+
+  // GET /admin/census - census minds with a callable door on a provider we
+  // speak, marked with which legs already exist here
+  router.get('/census', async (req: AuthRequest, res) => {
+    try {
+      const census = await fetchCensus();
+      const have = await ModelLoader.getInstance().loadModels();
+      const byLeg = new Map<string, string>(); // provider|providerModelId -> model id
+      for (const m of have) {
+        byLeg.set(`${m.provider}|${stripRegion(m.providerModelId).toLowerCase()}`, m.id);
+      }
+      const out: any[] = [];
+      for (const [mindId, m] of Object.entries<any>(census.models || {})) {
+        const legs: any[] = [];
+        for (const d of m.doors || []) {
+          const provider = CENSUS_SOURCE_TO_PROVIDER[d.source];
+          if (!provider || !d.listed_now) continue;
+          if (/:batch$/.test(d.id)) continue;
+          const ping = d.ping || {};
+          legs.push({
+            provider,
+            providerModelId: d.id,
+            regions: d.regions || null,
+            maxOut: d.max_out || null,
+            state: ping.state || null,
+            existingId: byLeg.get(`${provider}|${stripRegion(d.id).toLowerCase()}`) || null,
+          });
+        }
+        if (!legs.length) continue;
+        out.push({
+          mindId,
+          display: m.display,
+          role: m.role || null,
+          io: m.io || null,
+          reach: m.reach || null,
+          firstSeen: m.first_seen || null,
+          legs,
+          anyExisting: legs.some(l => l.existingId),
+          allExisting: legs.every(l => l.existingId),
+        });
+      }
+      out.sort((a, b) => (b.firstSeen || '').localeCompare(a.firstSeen || ''));
+
+      // Served legs the census cannot see any more: door gone from its catalog,
+      // or probed dead. Never deleted (conversation participants reference
+      // these ids) — the admin can hide them.
+      const doorIndex = new Map<string, any>();
+      for (const m of Object.values<any>(census.models || {})) {
+        for (const d of m.doors || []) {
+          const provider = CENSUS_SOURCE_TO_PROVIDER[d.source];
+          if (provider) doorIndex.set(`${provider}|${stripRegion(d.id).toLowerCase()}`, d);
+        }
+      }
+      const stale: any[] = [];
+      for (const m of have) {
+        if (!['anthropic', 'openrouter', 'bedrock'].includes(m.provider)) continue;
+        const d = doorIndex.get(`${m.provider}|${stripRegion(m.providerModelId).toLowerCase()}`);
+        let why: string | null = null;
+        if (!d) why = 'door never seen by the census (scans since 2026-06-24)';
+        else if (!d.listed_now) why = `not listed now (last seen ${(d.last_seen || '').slice(0, 10)})`;
+        else if ((d.ping || {}).state === 'dead') why = 'listed but probe hard-fails';
+        if (why) stale.push({ id: m.id, provider: m.provider, providerModelId: m.providerModelId,
+                              displayName: m.displayName, hidden: m.hidden, why });
+      }
+      res.json({ source: CENSUS_URL, generatedAt: census.generated_at, minds: out, stale });
+    } catch (error) {
+      console.error('Error reading census:', error);
+      res.status(502).json({ error: `Census beacon unavailable: ${(error as Error).message}` });
+    }
+  });
+
+  const ImportSchema = z.object({
+    items: z.array(z.object({
+      mindId: z.string(),
+      provider: z.enum(['anthropic', 'openrouter', 'bedrock']),
+      providerModelId: z.string().min(1),
+      displayName: z.string().optional(),
+      shortName: z.string().optional(),
+      currencies: z.record(z.boolean()).optional(),
+      contextWindow: z.number().optional(),
+      outputTokenLimit: z.number().optional(),
+    })).min(1),
+  });
+
+  // POST /admin/models/import - add census legs as system models (overlay file)
+  router.post('/models/import', async (req: AuthRequest, res) => {
+    try {
+      const { items } = ImportSchema.parse(req.body);
+      const census = await fetchCensus();
+      const entries: any[] = [];
+      for (const it of items) {
+        const mind = (census.models || {})[it.mindId] || {};
+        const door = (mind.doors || []).find((d: any) => d.id === it.providerModelId) || {};
+        const display = it.displayName || mind.display || it.providerModelId;
+        const canonicalId = slug(mind.display || it.providerModelId);
+        const isAnthropic = it.provider === 'anthropic';
+        const id = isAnthropic ? canonicalId : `${canonicalId}-${it.provider}`;
+        const outputTokenLimit = it.outputTokenLimit || door.max_out || 8192;
+        const io = mind.io || { in: [], out: [] };
+        entries.push({
+          id,
+          providerModelId: it.providerModelId,
+          canonicalId,
+          displayName: isAnthropic ? display : `${display} (${it.provider === 'openrouter' ? 'OpenRouter' : 'Bedrock'})`,
+          shortName: it.shortName || display.split('/').pop(),
+          provider: it.provider,
+          hidden: false,
+          contextWindow: it.contextWindow || 128000,
+          outputTokenLimit,
+          supportsPrefill: false,
+          capabilities: {
+            imageInput: (io.in || []).includes('image'),
+            pdfInput: (io.in || []).includes('file') || (io.in || []).includes('pdf'),
+            audioInput: (io.in || []).includes('audio'),
+            videoInput: (io.in || []).includes('video'),
+          },
+          currencies: it.currencies || { 'models-2025': true, credit: true },
+          settings: {
+            temperature: { min: 0, max: isAnthropic ? 1 : 2, default: 1, step: 0.1 },
+            maxTokens: { min: 1, max: outputTokenLimit, default: Math.min(8096, outputTokenLimit) },
+            topP: { min: 0, max: 1, default: 1, step: 0.01 },
+          },
+          censusMindId: it.mindId,
+          censusAddedAt: new Date().toISOString(),
+        });
+      }
+      const added = await ModelLoader.getInstance().addLocalModels(entries);
+      res.json({ added, skipped: entries.map(e => e.id).filter(i => !added.includes(i)) });
+    } catch (error) {
+      console.error('Error importing census models:', error);
+      res.status(400).json({ error: (error as Error).message });
+    }
+  });
+
+  // POST /admin/models/local/override - per-model override kept in the overlay
+  // (survives deploys, unlike PATCH /models/:id/visibility which edits models.json)
+  router.post('/models/local/override', async (req: AuthRequest, res) => {
+    try {
+      const { id, hidden } = z.object({ id: z.string(), hidden: z.boolean() }).parse(req.body);
+      await ModelLoader.getInstance().setLocalOverride(id, { hidden });
+      res.json({ success: true, id, hidden });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  });
+
+  // GET /admin/models/local - models living in the overlay file
+  router.get('/models/local', async (req: AuthRequest, res) => {
+    const local = await ModelLoader.getInstance().loadLocalModels();
+    res.json({ path: ModelLoader.getInstance().localModelsPath, models: local });
+  });
+
+  // DELETE /admin/models/local/:id - remove an overlay model
+  router.delete('/models/local/:id', async (req: AuthRequest, res) => {
+    const ok = await ModelLoader.getInstance().removeLocalModel(req.params.id);
+    if (!ok) return res.status(404).json({ error: 'not a local model' });
+    res.json({ success: true });
+  });
+
   // POST /admin/config/reload - Reload config from disk without changes
   router.post('/config/reload', async (req: AuthRequest, res) => {
     try {
@@ -449,6 +634,129 @@ export function adminRouter(db: Database): Router {
     } catch (error) {
       console.error('Error verifying legacy users:', error);
       res.status(500).json({ error: 'Failed to verify legacy users' });
+    }
+  });
+
+  // POST /admin/set-all-age-verified - Set age verified flag for all users
+  // For migrating users who registered before age gate was added
+  router.post('/set-all-age-verified', async (req: AuthRequest, res) => {
+    try {
+      const users = await db.getAllUsers();
+      console.log(`[Admin] set-all-age-verified: Found ${users.length} total users`);
+      
+      let updatedCount = 0;
+      const updatedUsers: string[] = [];
+      
+      for (const user of users) {
+        if (!user.ageVerified) {
+          await db.setAgeVerified(user.id);
+          updatedCount++;
+          updatedUsers.push(user.email);
+        }
+      }
+      
+      console.log(`[Admin] set-all-age-verified: Updated ${updatedCount} users`);
+      
+      res.json({ 
+        success: true, 
+        message: `Set age verified for ${updatedCount} user${updatedCount !== 1 ? 's' : ''}`,
+        updatedCount,
+        updatedUsers
+      });
+    } catch (error) {
+      console.error('Error setting age verified:', error);
+      res.status(500).json({ error: 'Failed to set age verified' });
+    }
+  });
+
+  // POST /admin/set-all-tos-accepted - Set ToS accepted flag for all users
+  // For migrating users who registered before ToS gate was added
+  router.post('/set-all-tos-accepted', async (req: AuthRequest, res) => {
+    try {
+      const users = await db.getAllUsers();
+      console.log(`[Admin] set-all-tos-accepted: Found ${users.length} total users`);
+      
+      let updatedCount = 0;
+      const updatedUsers: string[] = [];
+      
+      for (const user of users) {
+        if (!user.tosAccepted) {
+          await db.setTosAccepted(user.id);
+          updatedCount++;
+          updatedUsers.push(user.email);
+        }
+      }
+      
+      console.log(`[Admin] set-all-tos-accepted: Updated ${updatedCount} users`);
+      
+      res.json({ 
+        success: true, 
+        message: `Set ToS accepted for ${updatedCount} user${updatedCount !== 1 ? 's' : ''}`,
+        updatedCount,
+        updatedUsers
+      });
+    } catch (error) {
+      console.error('Error setting ToS accepted:', error);
+      res.status(500).json({ error: 'Failed to set ToS accepted' });
+    }
+  });
+
+  // GET /admin/conversation-size/:id - Get conversation data size for debugging
+  // Useful for diagnosing browser crashes from large images
+  router.get('/conversation-size/:id', async (req: AuthRequest, res) => {
+    try {
+      const conversationId = req.params.id;
+      
+      // Get conversation data as admin (bypass normal access control for diagnosis)
+      const messages = await db.getConversationMessagesAdmin(conversationId);
+      
+      if (!messages || messages.length === 0) {
+        return res.status(404).json({ error: 'Conversation not found or no messages' });
+      }
+      
+      // Analyze size
+      let totalContentLength = 0;
+      let totalImageDataLength = 0;
+      let imageCount = 0;
+      const messageStats: any[] = [];
+      
+      for (const message of messages) {
+        for (const branch of message.branches) {
+          totalContentLength += branch.content?.length || 0;
+          
+          if (branch.contentBlocks) {
+            for (const block of branch.contentBlocks) {
+              if ((block as any).type === 'image' && (block as any).data) {
+                imageCount++;
+                const dataLen = (block as any).data.length;
+                totalImageDataLength += dataLen;
+                messageStats.push({
+                  messageId: message.id.slice(0, 8),
+                  branchId: branch.id.slice(0, 8),
+                  imageSize: `${(dataLen / 1024 / 1024).toFixed(2)} MB`,
+                  mimeType: (block as any).mimeType
+                });
+              }
+            }
+          }
+        }
+      }
+      
+      const totalJson = JSON.stringify(messages);
+      
+      res.json({
+        conversationId,
+        messageCount: messages.length,
+        totalJsonSize: `${(totalJson.length / 1024 / 1024).toFixed(2)} MB`,
+        totalContentLength: `${(totalContentLength / 1024).toFixed(2)} KB`,
+        totalImageDataLength: `${(totalImageDataLength / 1024 / 1024).toFixed(2)} MB`,
+        imageCount,
+        images: messageStats,
+        warning: totalJson.length > 10 * 1024 * 1024 ? '⚠️ VERY LARGE - may crash browsers!' : null
+      });
+    } catch (error) {
+      console.error('Error getting conversation size:', error);
+      res.status(500).json({ error: 'Failed to get conversation size' });
     }
   });
 

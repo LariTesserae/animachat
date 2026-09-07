@@ -8,6 +8,10 @@ export const UserSchema = z.object({
   createdAt: z.date(),
   emailVerified: z.boolean().optional(), // Whether email has been verified
   emailVerifiedAt: z.date().optional(), // When email was verified
+  ageVerified: z.boolean().optional(), // Whether user has confirmed they are 18+
+  ageVerifiedAt: z.date().optional(), // When age was verified
+  tosAccepted: z.boolean().optional(), // Whether user has accepted Terms of Service
+  tosAcceptedAt: z.date().optional(), // When ToS was accepted
   apiKeys: z.array(z.object({
     id: z.string().uuid(),
     name: z.string(),
@@ -137,8 +141,9 @@ export type Provider = z.infer<typeof ProviderEnum>;
 // - 'auto': Use provider default (prefill for anthropic/bedrock, messages for others)
 // - 'prefill': Force prefill format (conversation log with participant names)
 // - 'messages': Force messages format (alternating user/assistant)
+// - 'pseudo-prefill': CLI simulation trick for non-prefill models in group chat
 // - 'completion': OpenRouter completion mode (prompt field instead of messages)
-export const ConversationModeEnum = z.enum(['auto', 'prefill', 'messages', 'completion']);
+export const ConversationModeEnum = z.enum(['auto', 'prefill', 'messages', 'pseudo-prefill', 'completion']);
 export type ConversationMode = z.infer<typeof ConversationModeEnum>;
 
 // Avatar Pack types
@@ -169,10 +174,27 @@ export const ModelSchema = z.object({
   outputTokenLimit: z.number(),
   supportsThinking: z.boolean().optional(), // Whether the model supports extended thinking
   thinkingDefaultEnabled: z.boolean().optional(), // Whether thinking should be enabled by default for this model
+  // For models with always-on reasoning (e.g. Fable 5), the Anthropic API requires
+  // the thinking config be sent on every request and accepts a display preference
+  // controlling how much of the reasoning is returned. Presence of this field:
+  //   1) forces the adaptive-thinking request shape on regardless of user settings
+  //      (the user can't actually disable reasoning on these models),
+  //   2) adds `display: <value>` to the `thinking` config in the request.
+  // Currently used with "summarized" for Fable 5; left as string to extend.
+  reasoningDisplay: z.string().optional(),
   supportsPrefill: z.boolean().optional(), // Whether model supports prefill/completion mode (defaults based on provider)
   capabilities: ModelCapabilitiesSchema.optional(), // Multimodal capabilities
   currencies: z.record(z.boolean()).optional(),
-  
+
+  // Custom endpoint settings, present when this Model was derived from a
+  // user-defined openai-compatible model with an embedded baseUrl. Spread on
+  // in ModelLoader.getAllModels; declared here so consumers (credit gating,
+  // inference routing) can read it type-safely.
+  customEndpoint: z.object({
+    baseUrl: z.string().url(),
+    apiKey: z.string().optional()
+  }).optional(),
+
   // Model-specific configurable settings (rendered as dynamic UI)
   configurableSettings: z.array(ConfigurableSettingSchema).optional(),
   
@@ -294,6 +316,7 @@ export const UserDefinedModelSchema = z.object({
   outputTokenLimit: z.number().min(100).max(1000000),
   supportsThinking: z.boolean().default(false),
   supportsPrefill: z.boolean().default(false), // Whether model supports prefill/completion mode
+  capabilities: ModelCapabilitiesSchema.optional(), // Multimodal capabilities (auto-detected from OpenRouter)
   hidden: z.boolean().default(false),
   settings: ModelSettingsSchema,
   createdAt: z.date(),
@@ -317,6 +340,7 @@ export const CreateUserModelSchema = z.object({
   outputTokenLimit: z.number().min(100).max(1000000),
   supportsThinking: z.boolean().optional(),
   supportsPrefill: z.boolean().optional(), // Whether model supports prefill/completion mode
+  capabilities: ModelCapabilitiesSchema.optional(), // Multimodal capabilities (auto-detected from OpenRouter)
   settings: ModelSettingsSchema.optional(),
   customEndpoint: z.object({
     baseUrl: z.string().url(),
@@ -355,12 +379,19 @@ export const ParticipantSchema = z.object({
   conversationId: z.string().uuid(),
   name: z.string(),
   type: z.enum(['user', 'assistant']),
+  userId: z.string().uuid().optional(), // The user who "owns" this participant (for user-type participants in collaborative chats)
   model: z.string().optional(), // Only for assistant participants
   systemPrompt: z.string().optional(), // Only for assistant participants
   settings: ModelSettingsSchema.optional(), // Only for assistant participants
   contextManagement: ContextManagementSchema.optional(), // Only for assistant participants
-  conversationMode: ConversationModeEnum.optional(), // Per-participant format override (auto, prefill, messages, completion)
+  conversationMode: ConversationModeEnum.optional(), // Per-participant format override (auto, prefill, messages, pseudo-prefill, completion)
+  pseudoPrefillMode: z.enum(['cat', 'tail-cut']).default('cat').optional(), // Pseudo-prefill continuation method
+  pseudoPrefillFilename: z.string().default('conversation.txt').optional(), // Filename for CLI simulation commands
   isActive: z.boolean().default(true),
+
+  // Persona context: large text body injected per-participant at inference time
+  // Contains memories, conversation history, or other material private to this participant
+  personaContext: z.string().optional(),
 
   // Persona system fields
   personaId: z.string().uuid().optional(), // If set, this participant is a persona
@@ -376,7 +407,10 @@ export const UpdateParticipantSchema = z.object({
   settings: ModelSettingsSchema.optional(),
   contextManagement: ContextManagementSchema.optional(),
   conversationMode: ConversationModeEnum.optional(), // Per-participant format override
+  pseudoPrefillMode: z.enum(['cat', 'tail-cut']).optional(),
+  pseudoPrefillFilename: z.string().optional(),
   isActive: z.boolean().optional(),
+  personaContext: z.string().optional(),
   // Persona system fields
   personaId: z.string().uuid().optional(),
   personaParticipationId: z.string().uuid().optional()
@@ -412,6 +446,16 @@ export const AttachmentSchema = z.object({
 
 export type Attachment = z.infer<typeof AttachmentSchema>;
 
+const WsAttachmentSchema = z.object({
+  fileName: z.string(),
+  fileType: z.string(),
+  content: z.string(),
+  fileSize: z.number().optional(),
+  mimeType: z.string().optional(),
+  encoding: z.enum(['base64', 'text', 'url']).optional()
+});
+export type WsAttachment = z.infer<typeof WsAttachmentSchema>;
+
 // Bookmark types
 export const BookmarkSchema = z.object({
   id: z.string().uuid(),
@@ -423,6 +467,22 @@ export const BookmarkSchema = z.object({
 });
 
 export type Bookmark = z.infer<typeof BookmarkSchema>;
+
+// Bookmark with denormalized fields needed for sidebar/jump-list rendering
+// without fetching the underlying message. `preview` is a short excerpt of
+// the bookmarked branch's content; `participantName`, `model`, and `role`
+// describe the message the bookmark anchors. Returned by
+// `Database.getConversationBookmarksEnriched` — useful when the client
+// doesn't have the full message tree loaded (e.g. paginated/virtualized
+// conversation views).
+export const EnrichedBookmarkSchema = BookmarkSchema.extend({
+  preview: z.string(),
+  participantName: z.string(),
+  model: z.string().nullable(),
+  role: z.enum(['user', 'assistant', 'system'])
+});
+
+export type EnrichedBookmark = z.infer<typeof EnrichedBookmarkSchema>;
 
 // Content block types for messages
 export const TextContentBlockSchema = z.object({
@@ -443,10 +503,14 @@ export const RedactedThinkingContentBlockSchema = z.object({
 });
 
 // Image content block for model-generated images (GPT-4o, Gemini, etc.)
+// Supports two formats:
+// - Legacy: inline base64 data in 'data' field
+// - New: reference to BlobStore in 'blobId' field
 export const ImageContentBlockSchema = z.object({
   type: z.literal('image'),
   mimeType: z.string(), // image/png, image/jpeg, etc.
-  data: z.string(), // Base64 encoded image data
+  data: z.string().optional(), // Base64 encoded image data (legacy/inline)
+  blobId: z.string().optional(), // Reference to BlobStore (new format)
   revisedPrompt: z.string().optional(), // The prompt as revised by the model (GPT returns this)
   width: z.number().optional(),
   height: z.number().optional()
@@ -461,12 +525,24 @@ export const AudioContentBlockSchema = z.object({
   transcript: z.string().optional() // Text transcript of the audio
 });
 
+// Display-only notice block: surfaces abnormal stream terminations (e.g.
+// stop_reason: refusal cutting a response mid-generation) to the user.
+// NEVER sent back to any model — every provider formatter forwards only the
+// block types it explicitly knows, so 'notice' blocks are dropped from API
+// requests. They must also never be folded into branch.content.
+export const NoticeContentBlockSchema = z.object({
+  type: z.literal('notice'),
+  noticeType: z.string().optional(), // stop_reason, e.g. 'refusal' | 'max_tokens' | 'pause_turn'
+  text: z.string()
+});
+
 export const ContentBlockSchema = z.discriminatedUnion('type', [
   TextContentBlockSchema,
   ThinkingContentBlockSchema,
   RedactedThinkingContentBlockSchema,
   ImageContentBlockSchema,
-  AudioContentBlockSchema
+  AudioContentBlockSchema,
+  NoticeContentBlockSchema
 ]);
 
 export type ContentBlock = z.infer<typeof ContentBlockSchema>;
@@ -474,6 +550,7 @@ export type TextContentBlock = z.infer<typeof TextContentBlockSchema>;
 export type ThinkingContentBlock = z.infer<typeof ThinkingContentBlockSchema>;
 export type ImageContentBlock = z.infer<typeof ImageContentBlockSchema>;
 export type AudioContentBlock = z.infer<typeof AudioContentBlockSchema>;
+export type NoticeContentBlock = z.infer<typeof NoticeContentBlockSchema>;
 
 // Post-hoc operations - modify how previous messages appear in future contexts
 export const PostHocOperationTypeSchema = z.enum(['hide', 'hide_before', 'edit', 'hide_attachment', 'unhide']);
@@ -493,6 +570,26 @@ export const PostHocOperationSchema = z.object({
 
 export type PostHocOperation = z.infer<typeof PostHocOperationSchema>;
 
+// Branch creation source - tracks how a branch was created for authenticity verification
+export const CreationSourceSchema = z.enum([
+  'inference',      // AI generated this content
+  'human_edit',     // Human edited/wrote this content
+  'regeneration',   // AI regeneration of a previous attempt
+  'split',          // Result of message split operation
+  'import',         // Imported from external source
+  'fork'            // Copied from another conversation via fork
+]);
+export type CreationSource = z.infer<typeof CreationSourceSchema>;
+
+// Prefix history entry - represents a message from prior context that's embedded in a fork
+export const PrefixHistoryEntrySchema = z.object({
+  role: z.enum(['user', 'assistant', 'system']),
+  content: z.string(),
+  participantName: z.string().optional(), // Name of who spoke (for display/context)
+  model: z.string().optional(),
+});
+export type PrefixHistoryEntry = z.infer<typeof PrefixHistoryEntrySchema>;
+
 // Message types
 export const MessageBranchSchema = z.object({
   id: z.string().uuid(),
@@ -511,7 +608,16 @@ export const MessageBranchSchema = z.object({
   debugRequest: z.any().optional(), // Raw LLM request for debugging (researchers/admins only)
   debugResponse: z.any().optional(), // Raw LLM response for debugging (researchers/admins only)
   // Post-hoc operation - if present, this message is an operation that affects a previous message
-  postHocOperation: PostHocOperationSchema.optional()
+  postHocOperation: PostHocOperationSchema.optional(),
+  // How this branch was created - for authenticity verification
+  // undefined means legacy data (pre-tracking), should be treated as unknown
+  creationSource: CreationSourceSchema.optional(),
+  // Prefix history - prior context that should be prepended when building LLM context
+  // Used for compressed forks where history is embedded in the first message
+  prefixHistory: z.array(PrefixHistoryEntrySchema).optional(),
+  // Branch privacy - if set, only this user can see this branch (and its descendants)
+  // Used for private notes, drafts, or content not meant to be shared with collaborators
+  privateToUserId: z.string().uuid().optional()
 });
 
 export type MessageBranch = z.infer<typeof MessageBranchSchema>;
@@ -550,7 +656,13 @@ export const ConversationSchema = z.object({
   archived: z.boolean().default(false),
   settings: ModelSettingsSchema,
   contextManagement: ContextManagementSchema.optional(), // Conversation-level default
-  prefillUserMessage: PrefillSettingsSchema.optional() // Settings for initial user message in prefill mode
+  prefillUserMessage: PrefillSettingsSchema.optional(), // Settings for initial user message in prefill mode
+  cliModePrompt: z.object({
+    enabled: z.boolean().default(true),
+    messageThreshold: z.number().default(10) // Apply CLI prompt for conversations under this many messages
+  }).optional(),
+  combineConsecutiveMessages: z.boolean().default(true).optional(), // Combine consecutive same-role messages when building context (default: true)
+  totalBranchCount: z.number().default(0).optional() // Cached count of non-system branches (calculated during event replay)
 });
 
 export type Conversation = z.infer<typeof ConversationSchema>;
@@ -572,11 +684,7 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     parentBranchId: z.string().uuid().optional(),
     participantId: z.string().uuid().optional(),
     responderId: z.string().uuid().optional(), // Which assistant should respond (if any)
-    attachments: z.array(z.object({
-      fileName: z.string(),
-      fileType: z.string(),
-      content: z.string()
-    })).optional(),
+    attachments: z.array(WsAttachmentSchema).optional(),
     hiddenFromAi: z.boolean().optional(), // If true, message is visible to humans but not included in AI context
     samplingBranches: z.number().min(1).max(10).optional() // Number of parallel response branches to generate
   }),
@@ -585,7 +693,8 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     conversationId: z.string().uuid(),
     messageId: z.string().uuid(),
     branchId: z.string().uuid(),
-    parentBranchId: z.string().uuid().optional() // Current visible parent, for correct branch parenting after switches
+    parentBranchId: z.string().uuid().optional(), // Current visible parent, for correct branch parenting after switches
+    samplingBranches: z.number().min(1).max(10).optional() // Number of parallel response branches to generate
   }),
   z.object({
     type: z.literal('edit'),
@@ -593,7 +702,10 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     messageId: z.string().uuid(),
     branchId: z.string().uuid(),
     content: z.string(),
-    responderId: z.string().uuid().optional() // Which assistant should respond after edit
+    attachments: z.array(WsAttachmentSchema).optional(), // Replacement attachments for the edited branch
+    responderId: z.string().uuid().optional(), // Which assistant should respond after edit
+    skipRegeneration: z.boolean().optional(), // If true, don't generate AI response after edit
+    samplingBranches: z.number().min(1).max(10).optional() // Number of parallel response branches to generate
   }),
   z.object({
     type: z.literal('delete'),
@@ -637,6 +749,9 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('typing'),
     conversationId: z.string().uuid(),
     isTyping: z.boolean()
+  }),
+  z.object({
+    type: z.literal('ping')
   })
 ]);
 
@@ -650,7 +765,8 @@ export const CreateConversationRequestSchema = z.object({
   systemPrompt: z.string().optional(),
   settings: ModelSettingsSchema.optional(),
   contextManagement: ContextManagementSchema.optional(),
-  prefillUserMessage: PrefillSettingsSchema.optional()
+  prefillUserMessage: PrefillSettingsSchema.optional(),
+  combineConsecutiveMessages: z.boolean().default(true).optional()
 });
 
 export type CreateConversationRequest = z.infer<typeof CreateConversationRequestSchema>;
@@ -726,8 +842,13 @@ export const InviteSchema = z.object({
   amount: z.number().positive(),
   currency: z.string().default('credit'),
   expiresAt: z.string().optional(),
+  maxUses: z.number().positive().optional(), // undefined = unlimited uses
+  useCount: z.number().default(0),
+  // Legacy fields for backwards compatibility (stores last claimer for single-use)
   claimedBy: z.string().uuid().optional(),
-  claimedAt: z.string().optional()
+  claimedAt: z.string().optional(),
+  // Track which users have claimed to prevent the same user claiming multiple times
+  claimedByUsers: z.array(z.string()).default([])
 });
 
 export type Invite = z.infer<typeof InviteSchema>;
@@ -898,6 +1019,123 @@ export const UpdateShareRequestSchema = z.object({
 });
 
 export type UpdateShareRequest = z.infer<typeof UpdateShareRequestSchema>;
+
+// =============================================================================
+// Site Configuration Types
+// =============================================================================
+
+/**
+ * Link configuration with optional label
+ */
+export const SiteLinkSchema = z.object({
+  url: z.string(),
+  label: z.string(),
+});
+export type SiteLink = z.infer<typeof SiteLinkSchema>;
+
+/**
+ * Content section for customizable pages
+ */
+export const ContentSectionSchema = z.object({
+  id: z.string(),
+  title: z.string().optional(),
+  content: z.string(), // Can be markdown or plain text
+  icon: z.string().optional(),
+});
+export type ContentSection = z.infer<typeof ContentSectionSchema>;
+
+/**
+ * Testimonial/voice entry
+ */
+export const TestimonialSchema = z.object({
+  id: z.string(),
+  author: z.string(),
+  attribution: z.string().optional(),
+  content: z.string(),
+  timestamp: z.string().optional(),
+});
+export type Testimonial = z.infer<typeof TestimonialSchema>;
+
+/**
+ * Site configuration schema - deployment-specific settings
+ * Loaded from /etc/claude-app/siteConfig.json (production) or config/siteConfig.json (dev)
+ */
+export const SiteConfigSchema = z.object({
+  // Branding
+  branding: z.object({
+    name: z.string().default('Arc Chat'),
+    tagline: z.string().default('Multi-agent conversations'),
+    logoVariant: z.enum(['arc', 'constellation', 'custom']).default('arc'),
+  }).default({}),
+  
+  // External links (null = don't show)
+  links: z.object({
+    discord: z.string().nullable().default(null),
+    github: z.string().nullable().default(null),
+    parentSite: SiteLinkSchema.nullable().default(null),
+    documentation: z.string().nullable().default(null),
+    exportTool: z.string().nullable().default(null),
+  }).default({}),
+  
+  // Operator/legal info
+  operator: z.object({
+    name: z.string().default('Arc Chat Team'),
+    contactEmail: z.string().nullable().default(null),
+    contactDiscord: z.string().nullable().default(null),
+  }).default({}),
+  
+  // Feature flags for optional content sections
+  features: z.object({
+    showTestimonials: z.boolean().default(false),
+    showPhilosophy: z.boolean().default(false),
+    showEcosystem: z.boolean().default(false),
+    showVoices: z.boolean().default(false), // Claude testimonials on about page
+  }).default({}),
+  
+  // Custom content sections (optional, for full customization)
+  content: z.object({
+    // About page sections
+    aboutSections: z.array(ContentSectionSchema).optional(),
+    // Testimonials/voices
+    testimonials: z.array(TestimonialSchema).optional(),
+    // Terms of service (markdown)
+    termsMarkdown: z.string().optional(),
+    // Privacy policy (markdown)
+    privacyMarkdown: z.string().optional(),
+  }).default({}),
+});
+
+export type SiteConfig = z.infer<typeof SiteConfigSchema>;
+
+/**
+ * Default site configuration - generic open-source defaults
+ */
+export const defaultSiteConfig: SiteConfig = {
+  branding: {
+    name: 'Arc Chat',
+    tagline: 'Multi-agent conversations',
+    logoVariant: 'arc',
+  },
+  links: {
+    discord: null,
+    github: null,
+    parentSite: null,
+    documentation: null,
+    exportTool: null,
+  },
+  operator: {
+    name: 'Arc Chat Team',
+    contactEmail: null,
+    contactDiscord: null,
+  },
+  features: {
+    showTestimonials: false,
+    showPhilosophy: false,
+    showEcosystem: false,
+    showVoices: false,
+  },
+  content: {},
+};
 
 /**
  * Derives a canonical model ID from model information.

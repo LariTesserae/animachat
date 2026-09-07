@@ -2,11 +2,18 @@
   <div class="conversation-tree-container">
     <div class="tree-controls pa-2">
       <v-btn
+        icon="mdi-crosshairs-gps"
+        size="small"
+        variant="text"
+        @click="centerOnNode"
+        title="Center on current node"
+      />
+      <v-btn
         icon="mdi-fit-to-page-outline"
         size="small"
         variant="text"
         @click="centerTree"
-        title="Center view"
+        title="Fit entire tree in view"
       />
       <v-btn
         icon="mdi-magnify-plus"
@@ -28,6 +35,22 @@
         variant="text"
         @click="toggleCompactMode"
         :title="compactMode ? 'Show all nodes' : 'Compact view'"
+      />
+      <v-btn
+        :icon="alignActivePath ? 'mdi-format-align-center' : 'mdi-format-align-left'"
+        size="small"
+        variant="text"
+        @click="toggleAlignActivePath"
+        :title="alignActivePath ? 'Default layout' : 'Align active path'"
+        :color="alignActivePath ? 'primary' : undefined"
+      />
+      <v-btn
+        :icon="collapseNonActive ? 'mdi-eye-off' : 'mdi-eye'"
+        size="small"
+        variant="text"
+        @click="toggleCollapseNonActive"
+        :title="collapseNonActive ? 'Show all branches' : 'Hide non-active branches'"
+        :color="collapseNonActive ? 'primary' : undefined"
       />
     </div>
     <svg ref="svgRef" class="tree-svg"></svg>
@@ -56,6 +79,7 @@ const props = defineProps<{
   currentBranchId?: string;
   selectedParentMessageId?: string;
   selectedParentBranchId?: string;
+  readBranchIds?: Set<string>; // Branches user has seen
 }>();
 
 const emit = defineEmits<{
@@ -80,8 +104,12 @@ const hoveredNode = ref<TreeNode | null>(null);
 const tooltipStyle = ref({ left: '0px', top: '0px' });
 const compactMode = ref(false);
 const compactModeManuallySet = ref(false); // Track if user manually toggled
+const alignActivePath = ref(false); // Align active path ancestors vertically
+const collapseNonActive = ref(false); // Hide nodes not on active path or immediate children of it
+const nodesWithCollapsedDescendants = ref(new Set<string>()); // Track nodes that have hidden children
 const store = useStore();
 const bookmarks = ref<Bookmark[]>([]);
+const lastTreeStructure = ref<string>(''); // Cache structure fingerprint to avoid re-renders during streaming
 
 let svg: d3.Selection<SVGElement, unknown, null, undefined>;
 let g: d3.Selection<SVGGElement, unknown, null, undefined>;
@@ -256,6 +284,100 @@ function filterCompactNodes(originalRoot: d3.HierarchyNode<TreeNode>): d3.Hierar
   return d3.hierarchy(simplifiedTree);
 }
 
+// Filter nodes to only show active path and immediate children of active path nodes
+function filterToActivePath(originalRoot: d3.HierarchyNode<TreeNode>): d3.HierarchyNode<TreeNode> {
+  // Clear the collapsed descendants tracker
+  nodesWithCollapsedDescendants.value = new Set<string>();
+  
+  // First, build the active path set by tracing from current node to root
+  const activePathIds = new Set<string>();
+  
+  function findActivePath(node: d3.HierarchyNode<TreeNode>): boolean {
+    const nodeId = `${node.data.messageId}-${node.data.branchId}`;
+    
+    // Check if this is the current node
+    if (node.data.messageId === props.currentMessageId && 
+        node.data.branchId === props.currentBranchId) {
+      activePathIds.add(nodeId);
+      return true;
+    }
+    
+    // Check children
+    if (node.children) {
+      for (const child of node.children) {
+        if (findActivePath(child)) {
+          activePathIds.add(nodeId);
+          return true;
+        }
+      }
+    }
+    
+    return false;
+  }
+  
+  findActivePath(originalRoot);
+  
+  // Helper to count all descendants in original tree
+  function countDescendants(node: d3.HierarchyNode<TreeNode>): number {
+    if (!node.children || node.children.length === 0) return 0;
+    return node.children.length + node.children.reduce((sum, c) => sum + countDescendants(c), 0);
+  }
+  
+  // Now filter the tree
+  function filterNode(node: d3.HierarchyNode<TreeNode>, parentOnActivePath: boolean): TreeNode | null {
+    const nodeId = `${node.data.messageId}-${node.data.branchId}`;
+    const isOnActivePath = activePathIds.has(nodeId);
+    
+    // Keep if: on active path OR immediate child of active path node
+    if (isOnActivePath || parentOnActivePath) {
+      // For children: only recurse if this node is on active path
+      // (immediate children of active path are kept but their descendants are not)
+      const filteredChildren = node.children 
+        ? node.children
+            .map(c => filterNode(c, isOnActivePath))
+            .filter(c => c !== null) as TreeNode[]
+        : [];
+      
+      // Check if this node has descendants that were filtered out
+      const originalDescendantCount = countDescendants(node);
+      const filteredDescendantCount = filteredChildren.reduce((sum, c) => {
+        // Count children of filtered children (since we kept immediate children)
+        const childInOriginal = node.children?.find(
+          oc => oc.data.messageId === c.messageId && oc.data.branchId === c.branchId
+        );
+        return sum + 1 + (childInOriginal ? countDescendants(childInOriginal) : 0);
+      }, 0);
+      
+      // If the node originally had children but now has fewer descendants, mark it
+      if (node.children && node.children.length > 0) {
+        // Check if any child has descendants that are now hidden
+        for (const child of node.children) {
+          const childId = `${child.data.messageId}-${child.data.branchId}`;
+          const childDescendants = countDescendants(child);
+          if (childDescendants > 0 && !activePathIds.has(childId)) {
+            // This child has descendants that will be hidden
+            nodesWithCollapsedDescendants.value.add(childId);
+          }
+        }
+      }
+      
+      return {
+        ...node.data,
+        children: filteredChildren
+      };
+    }
+    
+    return null;
+  }
+  
+  const filteredTree = filterNode(originalRoot, false);
+  if (!filteredTree) {
+    return originalRoot;
+  }
+  
+  return d3.hierarchy(filteredTree);
+}
+
 function initializeTree() {
   if (!svgRef.value || !treeData.value) return;
   
@@ -315,11 +437,16 @@ function fillColor(d: d3.HierarchyPointNode<TreeNode>) {
 
 function hasBlueOutline(d: d3.HierarchyPointNode<TreeNode>) {
   return (props.selectedParentMessageId && props.selectedParentBranchId &&
-         d.data.messageId === props.selectedParentMessageId && 
+         d.data.messageId === props.selectedParentMessageId &&
          d.data.branchId === props.selectedParentBranchId) ||
-        (!props.selectedParentMessageId && 
-         d.data.messageId === props.currentMessageId && 
+        (!props.selectedParentMessageId &&
+         d.data.messageId === props.currentMessageId &&
          d.data.branchId === props.currentBranchId);
+}
+
+// STUBBED: Unread check disabled pending architecture review
+function isUnread(d: d3.HierarchyPointNode<TreeNode>): boolean {
+  return false;
 }
 
 
@@ -345,6 +472,11 @@ function renderTree() {
     root = filterCompactNodes(originalRoot);
   }
   
+  // Apply collapse non-active filtering if enabled
+  if (collapseNonActive.value) {
+    root = filterToActivePath(root);
+  }
+  
   // Count total nodes to determine sizing
   const nodeCount = root.descendants().length;
   
@@ -356,7 +488,7 @@ function renderTree() {
     .size([width - 100, height - 100])
     .nodeSize([baseNodeRadius * 3, baseNodeRadius * 4]); // Dynamic spacing
   
-  const treeNodes = treeLayout(root);
+  let treeNodes = treeLayout(root);
   
   // Clear previous render
   g.selectAll('*').remove();
@@ -372,6 +504,52 @@ function renderTree() {
   while (currentNode) {
     activePath.add(`${currentNode.data.messageId}-${currentNode.data.branchId}`);
     currentNode = currentNode.parent;
+  }
+  
+  // Apply custom layout if active path alignment is enabled
+  if (alignActivePath.value && activePath.size > 0) {
+    // Simple approach: shift each level so the active path node at that level is at x=0
+    // This preserves all relative spacing (no overlaps) while aligning the active path
+    
+    const targetX = 0;
+    
+    // Group nodes by depth
+    const nodesByDepth = new Map<number, d3.HierarchyPointNode<TreeNode>[]>();
+    let maxDepth = 0;
+    for (const node of treeNodes.descendants()) {
+      const depth = node.depth;
+      maxDepth = Math.max(maxDepth, depth);
+      if (!nodesByDepth.has(depth)) {
+        nodesByDepth.set(depth, []);
+      }
+      nodesByDepth.get(depth)!.push(node);
+    }
+    
+    // Track the last shift applied (for levels below the active path)
+    let lastShift = 0;
+    
+    // For each depth level, find the active path node and calculate shift
+    for (let depth = 0; depth <= maxDepth; depth++) {
+      const nodes = nodesByDepth.get(depth);
+      if (!nodes) continue;
+      
+      // Find the active path node at this depth
+      const activeNode = nodes.find(node => {
+        const nodeId = `${node.data.messageId}-${node.data.branchId}`;
+        return activePath.has(nodeId);
+      });
+      
+      if (activeNode) {
+        // Calculate shift needed to move active node to targetX
+        lastShift = targetX - activeNode.x;
+      }
+      // If no active node at this level, use the last shift (for levels below active path)
+      
+      // Apply shift to ALL nodes at this depth
+      for (const node of nodes) {
+        node.x += lastShift;
+      }
+    }
   }
   
   // Add links (edges) - vertical links
@@ -557,11 +735,64 @@ function renderTree() {
         .style('line-height', '1.2')
         .text(d.data.bookmarkLabel);
     }
+    
+    // Add plus indicator for nodes with collapsed descendants
+    if (collapseNonActive.value) {
+      const nodeId = `${d.data.messageId}-${d.data.branchId}`;
+      if (nodesWithCollapsedDescendants.value.has(nodeId)) {
+        const plusSize = baseNodeRadius * 0.5;
+        const plusOffset = baseNodeRadius * 0.9;
+
+        // Draw a small circle background
+        g.append('circle')
+          .attr('cx', plusOffset)
+          .attr('cy', plusOffset)
+          .attr('r', plusSize * 0.9)
+          .style('fill', 'var(--v-theme-surface)')
+          .style('stroke', '#888')
+          .style('stroke-width', 1)
+          .style('pointer-events', 'none');
+
+        // Draw plus sign
+        g.append('path')
+          .attr('d', `M ${plusOffset - plusSize * 0.5},${plusOffset}
+                      L ${plusOffset + plusSize * 0.5},${plusOffset}
+                      M ${plusOffset},${plusOffset - plusSize * 0.5}
+                      L ${plusOffset},${plusOffset + plusSize * 0.5}`)
+          .style('stroke', '#888')
+          .style('stroke-width', Math.max(1.5, plusSize * 0.3))
+          .style('stroke-linecap', 'round')
+          .style('fill', 'none')
+          .style('pointer-events', 'none');
+      }
+    }
+
+    // Add unread indicator (notification dot) for unread branches
+    if (isUnread(d)) {
+      const dotSize = baseNodeRadius * 0.35;
+      const dotOffset = baseNodeRadius * 0.7;
+
+      // Draw an orange notification dot in the top-right
+      g.append('circle')
+        .attr('cx', dotOffset)
+        .attr('cy', -dotOffset)
+        .attr('r', dotSize)
+        .style('fill', '#ff9800') // Orange/amber color
+        .style('stroke', 'var(--v-theme-background)')
+        .style('stroke-width', 1.5)
+        .style('pointer-events', 'none');
+    }
   });
 
-  // Center the tree initially
-  centerTree();
+  // Use smart centering: fit entire tree if small, center on node if large
+  smartCenter();
 }
+
+// Minimum zoom scale threshold - if fitting the tree would zoom out below this, use centerOnNode instead
+const MIN_AUTO_FIT_SCALE = 0.4;
+
+// Preferred zoom scale when centering on a node
+const CENTER_ON_NODE_SCALE = 0.8;
 
 function centerTree() {
   if (!svg || !g || !treeData.value) return;
@@ -586,6 +817,87 @@ function centerTree() {
     );
 }
 
+// Calculate what scale centerTree would use without actually applying it
+function calculateFitScale(): number {
+  if (!g || !svgRef.value) return 1;
+  
+  const bounds = (g.node() as SVGGElement).getBBox();
+  const width = svgRef.value.clientWidth || 400;
+  const height = svgRef.value.clientHeight || 600;
+  
+  const fullWidth = bounds.width;
+  const fullHeight = bounds.height;
+  
+  return 0.9 / Math.max(fullWidth / width, fullHeight / height);
+}
+
+// Center view on the currently active/selected node
+function centerOnNode() {
+  if (!svg || !g || !treeData.value) return;
+  
+  const width = svgRef.value?.clientWidth || 400;
+  const height = svgRef.value?.clientHeight || 600;
+  
+  // Find the active node (the one with blue outline)
+  // Priority: selectedParent if exists, otherwise current message/branch
+  let targetMessageId = props.selectedParentMessageId || props.currentMessageId;
+  let targetBranchId = props.selectedParentBranchId || props.currentBranchId;
+  
+  if (!targetMessageId || !targetBranchId) return;
+  
+  // Find the node element in the SVG
+  const nodes = g.selectAll('.node').data() as d3.HierarchyPointNode<TreeNode>[];
+  const targetNode = nodes.find(d => 
+    d.data.messageId === targetMessageId && 
+    d.data.branchId === targetBranchId
+  );
+  
+  if (!targetNode) {
+    // Node not found, fall back to centerTree
+    centerTree();
+    return;
+  }
+  
+  // Get node position (with the +50 offset that's applied in renderTree)
+  const nodeX = targetNode.x + 50;
+  const nodeY = targetNode.y + 50;
+  
+  // Determine zoom scale:
+  // - If current scale is less than preferred, zoom in to preferred
+  // - Otherwise maintain current scale
+  const currentTransform = d3.zoomTransform(svg.node()!);
+  const currentScale = currentTransform.k;
+  const targetScale = Math.max(currentScale, CENTER_ON_NODE_SCALE);
+  
+  // Calculate translation to center the node
+  const translate = [
+    width / 2 - targetScale * nodeX,
+    height / 2 - targetScale * nodeY
+  ];
+  
+  svg.transition()
+    .duration(750)
+    .call(
+      zoom.transform as any,
+      d3.zoomIdentity.translate(translate[0], translate[1]).scale(targetScale)
+    );
+}
+
+// Smart centering: center on node if tree is large, otherwise fit entire tree
+function smartCenter() {
+  if (!svg || !g || !treeData.value) return;
+  
+  const fitScale = calculateFitScale();
+  
+  if (fitScale < MIN_AUTO_FIT_SCALE) {
+    // Tree is too large to fit nicely, center on current node instead
+    centerOnNode();
+  } else {
+    // Tree is small enough, fit entire tree in view
+    centerTree();
+  }
+}
+
 function zoomIn() {
   if (!svg || !zoom) return;
   svg.transition().duration(300).call(zoom.scaleBy as any, 1.3);
@@ -601,6 +913,14 @@ function toggleCompactMode() {
   compactModeManuallySet.value = true; // User has manually toggled
 }
 
+function toggleAlignActivePath() {
+  alignActivePath.value = !alignActivePath.value;
+}
+
+function toggleCollapseNonActive() {
+  collapseNonActive.value = !collapseNonActive.value;
+}
+
 // Load bookmarks
 async function loadBookmarks() {
   try {
@@ -614,18 +934,54 @@ async function loadBookmarks() {
   }
 }
 
-// Watch for changes and re-render
+// Generate a fingerprint of tree structure (IDs only, not content)
+// This helps us avoid re-rendering during streaming when only content changes
+function getTreeStructureFingerprint(): string {
+  if (!props.messages || props.messages.length === 0) return '';
+  
+  // Build fingerprint from: message IDs, branch IDs, parent relationships, active branches
+  const parts: string[] = [];
+  for (const msg of props.messages) {
+    parts.push(`m:${msg.id}:${msg.activeBranchId}`);
+    for (const branch of msg.branches) {
+      parts.push(`b:${branch.id}:${branch.parentBranchId || 'root'}`);
+    }
+  }
+  // Include bookmarks
+  parts.push(`bm:${bookmarks.value.map(b => b.id).join(',')}`);
+  
+  return parts.join('|');
+}
+
+// Check if structure changed and render if needed
+function renderIfStructureChanged() {
+  const newFingerprint = getTreeStructureFingerprint();
+  if (newFingerprint !== lastTreeStructure.value) {
+    lastTreeStructure.value = newFingerprint;
+    renderTree();
+  }
+}
+
+// Watch for selection/UI changes - render immediately (no debounce)
 watch([
-  () => props.messages,
   () => props.currentMessageId,
   () => props.currentBranchId,
   () => props.selectedParentMessageId,
   () => props.selectedParentBranchId,
   () => props.participants,
+  () => props.readBranchIds,
   bookmarks,
-  compactMode
+  compactMode,
+  alignActivePath,
+  collapseNonActive
 ], () => {
-  renderTree();
+  renderTree(); // Immediate render for user interactions
+});
+
+// Watch for message changes separately - only render if structure changed
+// This prevents re-renders during streaming (content-only updates)
+watch(() => props.messages, () => {
+  renderIfStructureChanged();
 }, { deep: true });
 
 // Reset manual flag when messages change significantly (new conversation)

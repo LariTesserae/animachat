@@ -2,6 +2,11 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Message, getActiveBranch, ModelSettings } from '@deprecated-claude/shared';
 import { Database } from '../database/index.js';
 import { llmLogger } from '../utils/llmLogger.js';
+import sharp from 'sharp';
+import { isImageFile } from './attachment-utils.js';
+
+// Anthropic's image size limit is 5MB, we target 4MB to have margin
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
 export class AnthropicService {
   private client: Anthropic;
@@ -16,7 +21,17 @@ export class AnthropicService {
     }
     
     this.client = new Anthropic({
-      apiKey: resolvedKey || 'missing-api-key'
+      apiKey: resolvedKey || 'missing-api-key',
+      // Opt in to the extended-cache-TTL beta so the `cache_control: { ttl: '1h' }`
+      // markers we emit on system prompts and message-history breakpoints actually
+      // mean 1 hour. Without this header the API silently falls back to the
+      // default 5-minute ephemeral TTL — the request still succeeds and caching
+      // still works, just for a shorter window than the code intends. That's a
+      // significant cost-savings regression for long-running conversations
+      // (which were the whole point of the 1h TTL choice).
+      defaultHeaders: {
+        'anthropic-beta': 'extended-cache-ttl-2025-04-11',
+      },
     });
   }
 
@@ -26,7 +41,11 @@ export class AnthropicService {
     systemPrompt: string | undefined,
     settings: ModelSettings,
     onChunk: (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => Promise<void>,
-    stopSequences?: string[]
+    stopSequences?: string[],
+    // Model.reasoningDisplay — set on always-on-reasoning models (e.g. Fable 5).
+    // Presence forces the adaptive-thinking request shape on and adds
+    // `display: <value>` to the `thinking` config. See shared/types.ts.
+    reasoningDisplay?: string
   ): Promise<{
     usage?: {
       inputTokens: number;
@@ -57,7 +76,7 @@ export class AnthropicService {
 
     try {
       // Convert messages to Anthropic format
-      const anthropicMessages = this.formatMessagesForAnthropic(messages);
+      const anthropicMessages = await this.formatMessagesForAnthropic(messages);
       
       // Debug logging
       console.log(`Total messages to Anthropic: ${anthropicMessages.length}`);
@@ -95,9 +114,32 @@ export class AnthropicService {
         }
       }
       
-      // Ensure max_tokens > budget_tokens when thinking is enabled
+      // Always-on reasoning models (declared via Model.reasoningDisplay on the
+      // model entry) cannot have reasoning disabled: the thinking config must be
+      // sent on every request, and uses the adaptive shape. The presence of
+      // reasoningDisplay alone is enough; we also OR in the substring allowlist
+      // below for models that haven't yet been migrated to the config-driven flag.
+      const alwaysOnReasoning = !!reasoningDisplay;
+      // Determine if this model uses adaptive thinking (`type: 'adaptive'` +
+      // `output_config.effort`) vs legacy `type: 'enabled' + budget_tokens`.
+      // Anthropic 400s with "thinking.type.enabled is not supported for this
+      // model" if this is wrong.
+      // FIXME: this remains a brittle substring allowlist for the opus models
+      // that pre-date Model.reasoningDisplay — long-term they should all declare
+      // their thinking-API shape on the model entry too (cf. issue #121's note
+      // on hardcoded model registries; same pattern as the pricing-table fix
+      // in #120).
+      const useAdaptiveThinking =
+        alwaysOnReasoning ||
+        modelId.includes('opus-4-7') ||
+        modelId.includes('opus-4-8') ||
+        modelId.includes('opus-4-9') ||
+        modelId.includes('opus-5') ||
+        modelId.includes('fable-5');
+
+      // Ensure max_tokens > budget_tokens when legacy thinking is enabled
       let effectiveMaxTokens = settings.maxTokens;
-      if (settings.thinking?.enabled && settings.thinking.budgetTokens) {
+      if (!useAdaptiveThinking && settings.thinking?.enabled && settings.thinking.budgetTokens) {
         // max_tokens must be greater than budget_tokens
         // Add reasonable room for the actual response (at least 4096 tokens)
         const minMaxTokens = settings.thinking.budgetTokens + 4096;
@@ -106,11 +148,38 @@ export class AnthropicService {
           effectiveMaxTokens = minMaxTokens;
         }
       }
-      
+
       // Anthropic API doesn't allow both temperature AND top_p/top_k together
       // If temperature is set, don't send top_p/top_k
       const useTemperature = settings.temperature !== undefined;
-      
+
+      // Build thinking config based on model capabilities.
+      // `alwaysOnReasoning` models (those with Model.reasoningDisplay set) must
+      // send the thinking config every request regardless of the user's
+      // `settings.thinking.enabled` — they can't actually be turned off.
+      let thinkingConfig: any = undefined;
+      let outputConfig: any = undefined;
+      if (alwaysOnReasoning || settings.thinking?.enabled) {
+        if (useAdaptiveThinking) {
+          // Adaptive thinking with effort control (Opus 4.7+, Fable 5, …)
+          thinkingConfig = { type: 'adaptive' };
+          // Always-on models accept a `display` preference controlling how much
+          // of the reasoning is returned. e.g. Fable 5 → display: 'summarized'.
+          if (reasoningDisplay) {
+            thinkingConfig.display = reasoningDisplay;
+          }
+          const effort = settings.modelSpecific?.thinkingEffort;
+          outputConfig = { effort: typeof effort === 'string' ? effort : 'medium' };
+          console.log(`[Anthropic API] Using adaptive thinking with effort: ${outputConfig.effort}${reasoningDisplay ? `, display: ${reasoningDisplay}` : ''}`);
+        } else {
+          // Legacy models: enabled thinking with budget_tokens.
+          // (Unreachable when alwaysOnReasoning=true because that forces
+          // useAdaptiveThinking=true above; so settings.thinking must be
+          // defined here via the outer settings.thinking?.enabled branch.)
+          thinkingConfig = { type: 'enabled', budget_tokens: settings.thinking!.budgetTokens };
+        }
+      }
+
       requestParams = {
         model: modelId,
         max_tokens: effectiveMaxTokens,
@@ -119,12 +188,8 @@ export class AnthropicService {
         ...(!useTemperature && settings.topK !== undefined && { top_k: settings.topK }),
         ...(systemContent && { system: systemContent }),
         ...(stopSequences && stopSequences.length > 0 && { stop_sequences: stopSequences }),
-        ...(settings.thinking && settings.thinking.enabled && {
-          thinking: {
-            type: 'enabled',
-            budget_tokens: settings.thinking.budgetTokens
-          }
-        }),
+        ...(thinkingConfig && { thinking: thinkingConfig }),
+        ...(outputConfig && { output_config: outputConfig }),
         messages: anthropicMessages,
         stream: true
       };
@@ -199,6 +264,13 @@ export class AnthropicService {
       const stream = await this.client.messages.create(requestParams) as any;
 
       let stopReason: string | undefined;
+      // Structured refusal details (stop_details) — sent by the API alongside
+      // stop_reason: 'refusal'. Shape: { type: 'refusal', category, explanation }.
+      // category (e.g. 'cyber' | 'bio' | 'reasoning_extraction' | 'frontier_llm')
+      // identifies an external safety-classifier intervention; category: null
+      // means the model itself declined. Not in SDK types at ^0.60.0, so read
+      // via `as any`.
+      let stopDetails: { category?: string | null; explanation?: string | null } | undefined;
       let usage: any = {};
       let cacheMetrics = {
         cacheCreationInputTokens: 0,
@@ -215,12 +287,26 @@ export class AnthropicService {
           console.log(`[Anthropic API] Stream error:`, chunk.error);
         }
         
-        // Capture cache metrics from message_start
+        // Capture cache metrics AND fresh input_tokens from message_start.
+        //
+        // CRITICAL: input_tokens is canonically reported on `message_start.message.usage`.
+        // `message_delta.usage` may or may not re-emit it depending on the API
+        // version / SDK / model. We must capture it here, on the FIRST event of
+        // the stream — otherwise any message_delta that carries only
+        // `output_tokens` will, via the replace-not-merge at line 319, zero out
+        // our fresh-input count and trigger a structural undercount of the
+        // entire fresh-input portion of the bill on every Anthropic-direct call.
         if (chunk.type === 'message_start' && chunk.message?.usage) {
           const messageUsage = chunk.message.usage;
           cacheMetrics.cacheCreationInputTokens = messageUsage.cache_creation_input_tokens || 0;
           cacheMetrics.cacheReadInputTokens = messageUsage.cache_read_input_tokens || 0;
-          console.log('[Anthropic API] Cache metrics:', cacheMetrics);
+          if (typeof messageUsage.input_tokens === 'number') {
+            usage.input_tokens = messageUsage.input_tokens;
+          }
+          if (typeof messageUsage.output_tokens === 'number') {
+            usage.output_tokens = messageUsage.output_tokens;
+          }
+          console.log('[Anthropic API] Cache metrics:', cacheMetrics, 'initial usage:', usage);
         }
         
         // Handle content block start
@@ -232,8 +318,13 @@ export class AnthropicService {
             currentBlock.thinking = '';
             console.log('[Anthropic API] Thinking block started');
           } else if (chunk.content_block.type === 'redacted_thinking') {
-            currentBlock.data = '';
-            console.log('[Anthropic API] Redacted thinking block started');
+            // redacted_thinking arrives COMPLETE in content_block_start — there is
+            // no delta type for its data (RawContentBlockDelta has no redacted
+            // variant). The spread above already captured `data`; do NOT reset it,
+            // or the encrypted payload is lost and the round-trip block becomes
+            // invalid (API 400s on the next turn).
+            currentBlock.data = chunk.content_block.data ?? '';
+            console.log(`[Anthropic API] Redacted thinking block started (data: ${currentBlock.data.length} chars)`);
           } else if (chunk.content_block.type === 'text') {
             currentBlock.text = '';
           }
@@ -284,9 +375,18 @@ export class AnthropicService {
             if (chunk.delta?.stop_sequence) {
               console.log(`[Anthropic API] Stop sequence: "${chunk.delta.stop_sequence}"`);
             }
+            const rawStopDetails = (chunk.delta as any)?.stop_details;
+            if (rawStopDetails) {
+              stopDetails = rawStopDetails;
+              console.log(`[Anthropic API] Stop details:`, JSON.stringify(rawStopDetails));
+            }
           }
           if (chunk.usage) {
-            usage = chunk.usage;
+            // MERGE, not replace. `message_delta.usage` typically carries only
+            // `output_tokens` (the running output total); replacing the object
+            // would clobber the `input_tokens` we captured from `message_start`
+            // and zero out the fresh-input portion of the bill.
+            usage = { ...usage, ...chunk.usage };
             console.log(`[Anthropic API] Token usage:`, usage);
           }
         } else if (chunk.type === 'message_stop') {
@@ -301,28 +401,98 @@ export class AnthropicService {
           // If no API thinking blocks but response contains <think> tags (prefill mode),
           // parse them into contentBlocks for proper UI display
           let finalContentBlocks = contentBlocks;
+          const fullResponseText = chunks.join('');
           if (contentBlocks.length === 0) {
-            const fullResponse = chunks.join('');
-            const parsedBlocks = this.parseThinkingTags(fullResponse);
+            const parsedBlocks = this.parseThinkingTags(fullResponseText);
             if (parsedBlocks.length > 0) {
               finalContentBlocks = parsedBlocks;
               console.log(`[Anthropic API] Parsed ${parsedBlocks.length} thinking blocks from prefill response`);
             }
           }
-          
+
+          // Surface abnormal stop reasons (refusal / max_tokens / pause_turn) to
+          // the user. e.g. an Anthropic safety refusal returns
+          // stop_reason='refusal' and terminates the stream — with partial text
+          // this renders as a silent mid-sentence cutoff that users mistake for
+          // a max_tokens truncation; with no text at all the turn renders empty
+          // (only the signed/redacted thinking block remains).
+          //
+          // IMPORTANT: the notice is injected as a DISPLAY-ONLY `notice` content
+          // block. It must never reach the model on later turns, so:
+          //  - it is NOT streamed as a text chunk (chunks accumulate into
+          //    branch.content, which round-trips through every provider), and
+          //  - it is NOT a `text` block (formatMessagesForAnthropic forwards
+          //    those). Provider formatters only forward block types they
+          //    explicitly know, so `notice` blocks are dropped from requests.
+          const TERMINATED_NORMALLY = new Set(['end_turn', 'stop_sequence', 'tool_use']);
+          const hasVisibleText = fullResponseText.length > 0;
+          if (stopReason && !TERMINATED_NORMALLY.has(stopReason)) {
+            let notice: string;
+            if (stopReason === 'refusal') {
+              // stop_reason: refusal covers two distinct events, distinguished
+              // by stop_details.category:
+              //  - category present (cyber / bio / reasoning_extraction /
+              //    frontier_llm / ...) → an external safety classifier stopped
+              //    the response; the model did not choose this.
+              //  - category null/absent → the refusal came from the model side.
+              // Surfacing which one it was (plus the API's own explanation)
+              // tells the user what actually happened instead of a generic
+              // "refusal".
+              const category = stopDetails?.category ?? null;
+              const explanation = stopDetails?.explanation ?? null;
+              const parts: string[] = [];
+              parts.push(hasVisibleText
+                ? '⚠️ Response cut off by a safety stop (`stop_reason: refusal`) — an API-side stop, not a max_tokens truncation.'
+                : '⚠️ Response withheld by a safety stop (`stop_reason: refusal`). The model may have reasoned, but its answer was not surfaced.');
+              if (category) {
+                parts.push(`An external safety classifier intervened (category: \`${category}\`) — this was triggered by the flagged topic area, not by the model declining.`);
+                parts.push('Rephrasing away from the flagged territory is more likely to help than a plain retry.');
+              } else if (stopDetails) {
+                parts.push('No classifier category was reported (`stop_details.category: null`), which usually means the refusal came from the model rather than an external classifier. Retrying or rephrasing may help.');
+              } else {
+                parts.push('The API sent no further detail (`stop_details` absent — older models don\'t report it). Retrying or rephrasing may help.');
+              }
+              if (explanation) {
+                parts.push(`API explanation: ${explanation}`);
+              }
+              notice = parts.join(' ');
+            } else if (stopReason === 'max_tokens') {
+              notice = hasVisibleText
+                ? '⚠️ Output truncated at the `max_tokens` limit. Raise max_tokens, or lower the thinking budget/effort.'
+                : '⚠️ Output truncated at the `max_tokens` limit before any visible text was produced — reasoning consumed the entire output budget. Raise max_tokens, or lower the thinking budget/effort.';
+            } else if (stopReason === 'pause_turn') {
+              notice = '⚠️ Model paused mid-turn (`stop_reason: pause_turn`). Continue to resume.';
+            } else {
+              notice = hasVisibleText
+                ? `⚠️ Response ended abnormally (\`stop_reason: ${stopReason}\`).`
+                : `⚠️ No visible output (\`stop_reason: ${stopReason}\`).`;
+            }
+            finalContentBlocks = [...finalContentBlocks, { type: 'notice', noticeType: stopReason, text: notice }];
+            console.log(`[Anthropic API] Injected display-only stop_reason notice (${stopReason}), hasVisibleText=${hasVisibleText}`);
+          }
+
           await onChunk('', true, finalContentBlocks, actualUsage);
           
-          // Log complete response summary
-          const fullResponse = chunks.join('');
+          // Log complete response summary (reusing fullResponseText computed above)
           console.log(`[Anthropic API] Response complete:`, {
             model: requestParams.model,
-            totalLength: fullResponse.length,
+            totalLength: fullResponseText.length,
             contentBlocks: contentBlocks.length,
             stopReason,
             usage,
             truncated: stopReason === 'max_tokens',
-            lastChars: fullResponse.slice(-100)
+            lastChars: fullResponseText.slice(-100)
           });
+
+          // DIAGNOSTIC: Detect when thinking happened but no text content followed.
+          // (We now also surface this case to the user via the notice injected
+          // above when stop_reason is non-normal — but keep the log for visibility.)
+          const hasThinkingBlocks = contentBlocks.some((b: any) => b.type === 'thinking' || b.type === 'redacted_thinking');
+          if (hasThinkingBlocks && fullResponseText.length === 0) {
+            console.warn(`[Anthropic API] ⚠️ DIAGNOSTIC: Thinking blocks present but NO text content generated!`);
+            console.warn(`[Anthropic API] ⚠️ Stop reason: ${stopReason}, Usage: input=${usage.input_tokens}, output=${usage.output_tokens}`);
+            console.warn(`[Anthropic API] ⚠️ This may be a token budget issue - thinking may have consumed all output tokens.`);
+          }
           
           // Calculate cost savings
           const costSaved = this.calculateCacheSavings(requestParams.model, cacheMetrics.cacheReadInputTokens);
@@ -418,7 +588,7 @@ export class AnthropicService {
     }
   }
 
-  formatMessagesForAnthropic(messages: Message[]): Array<{ role: 'user' | 'assistant'; content: any }> {
+  async formatMessagesForAnthropic(messages: Message[]): Promise<Array<{ role: 'user' | 'assistant'; content: any }>> {
     const formattedMessages: Array<{ role: 'user' | 'assistant'; content: any }> = [];
 
     for (const message of messages) {
@@ -460,16 +630,21 @@ export class AnthropicService {
             const mediaType = this.getMediaType(attachment.fileName, (attachment as any).mimeType);
             
             if (isImage) {
+              // Resize image if needed (Anthropic has 5MB limit)
+              const resizedContent = await this.resizeImageIfNeeded(attachment.content, attachment.fileName);
+              // After resize, always use JPEG media type since we convert during resize
+              const resizedMediaType = resizedContent !== attachment.content ? 'image/jpeg' : mediaType;
+              
               // Add image as a separate content block for Claude API
               contentParts.push({
                 type: 'image',
                 source: {
                   type: 'base64',
-                  media_type: mediaType,
-                  data: attachment.content
+                  media_type: resizedMediaType,
+                  data: resizedContent
                 }
               });
-              console.log(`Added image attachment: ${attachment.fileName} (${mediaType})`);
+              console.log(`Added image attachment: ${attachment.fileName} (${resizedMediaType})`);
             } else if (isPdf) {
               // Add PDF as a document content block for Claude API
               // Claude supports PDFs natively via the document type
@@ -513,14 +688,23 @@ export class AnthropicService {
             // Assistant message with thinking blocks - format as content array for API
             // This is required for models like Opus 4.5 to maintain chain of thought
             const apiContentBlocks: any[] = [];
+            let unsignedThinkingText = ''; // Collect thinking without signatures to prepend as text
             
             for (const block of activeBranch.contentBlocks) {
               if (block.type === 'thinking') {
-                apiContentBlocks.push({
-                  type: 'thinking',
-                  thinking: block.thinking,
-                  ...(block.signature && { signature: block.signature })
-                });
+                // Only send thinking as structured block if it has a signature
+                // Anthropic API requires signatures to verify thinking authenticity
+                // Thinking without signatures (e.g., imported) is converted to text
+                if (block.signature) {
+                  apiContentBlocks.push({
+                    type: 'thinking',
+                    thinking: block.thinking,
+                    signature: block.signature
+                  });
+                } else {
+                  // Collect unsigned thinking to include as text
+                  unsignedThinkingText += `<thinking>\n${block.thinking}\n</thinking>\n\n`;
+                }
               } else if (block.type === 'redacted_thinking') {
                 apiContentBlocks.push({
                   type: 'redacted_thinking',
@@ -530,6 +714,21 @@ export class AnthropicService {
                 apiContentBlocks.push({
                   type: 'text',
                   text: block.text
+                });
+              }
+            }
+            
+            // If we have unsigned thinking, prepend it to the text content
+            if (unsignedThinkingText) {
+              const existingTextIndex = apiContentBlocks.findIndex(b => b.type === 'text');
+              if (existingTextIndex >= 0) {
+                // Prepend to existing text block
+                apiContentBlocks[existingTextIndex].text = unsignedThinkingText + apiContentBlocks[existingTextIndex].text;
+              } else {
+                // Create new text block with the thinking + main content
+                apiContentBlocks.push({
+                  type: 'text',
+                  text: unsignedThinkingText + messageContent.trim()
                 });
               }
             }
@@ -618,9 +817,58 @@ export class AnthropicService {
   }
   
   private isImageAttachment(fileName: string): boolean {
-    const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-    const extension = fileName.split('.').pop()?.toLowerCase() || '';
-    return imageExtensions.includes(extension);
+    return isImageFile(fileName);
+  }
+  
+  /**
+   * Resize an image if it exceeds the max size limit (4MB to stay under Anthropic's 5MB limit)
+   * Returns the resized base64 string, or the original if already small enough
+   */
+  private async resizeImageIfNeeded(base64Data: string, fileName: string): Promise<string> {
+    // Calculate size of base64 data (base64 is ~4/3 of binary size)
+    const estimatedBytes = Math.ceil(base64Data.length * 0.75);
+    
+    if (estimatedBytes <= MAX_IMAGE_BYTES) {
+      return base64Data; // Already small enough
+    }
+    
+    console.log(`[Anthropic] Image ${fileName} is ${(estimatedBytes / 1024 / 1024).toFixed(2)}MB, resizing...`);
+    
+    try {
+      // Decode base64 to buffer
+      const inputBuffer = Buffer.from(base64Data, 'base64');
+      
+      // Get image metadata to calculate resize ratio
+      const metadata = await sharp(inputBuffer).metadata();
+      if (!metadata.width || !metadata.height) {
+        console.warn(`[Anthropic] Could not get image dimensions for ${fileName}, using original`);
+        return base64Data;
+      }
+      
+      // Calculate how much we need to shrink (target 80% of max to have margin)
+      const targetBytes = MAX_IMAGE_BYTES * 0.8;
+      const shrinkRatio = Math.sqrt(targetBytes / estimatedBytes);
+      const newWidth = Math.floor(metadata.width * shrinkRatio);
+      const newHeight = Math.floor(metadata.height * shrinkRatio);
+      
+      console.log(`[Anthropic] Resizing from ${metadata.width}x${metadata.height} to ${newWidth}x${newHeight}`);
+      
+      // Resize and convert to JPEG for better compression
+      const resizedBuffer = await sharp(inputBuffer)
+        .resize(newWidth, newHeight, { fit: 'inside' })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      const resizedBase64 = resizedBuffer.toString('base64');
+      const newSize = Math.ceil(resizedBase64.length * 0.75);
+      
+      console.log(`[Anthropic] Resized ${fileName}: ${(estimatedBytes / 1024 / 1024).toFixed(2)}MB -> ${(newSize / 1024 / 1024).toFixed(2)}MB`);
+      
+      return resizedBase64;
+    } catch (error) {
+      console.error(`[Anthropic] Failed to resize image ${fileName}:`, error);
+      return base64Data; // Return original on error
+    }
   }
   
   private isPdfAttachment(fileName: string): boolean {

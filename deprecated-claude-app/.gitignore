@@ -24,5 +24,14 @@ certs/
 *.crt
 *.csr
 
-*.md
-*.txt
+# Site configuration (deployment-specific)
+backend/config/siteConfig.json
+backend/config/siteConfig.production.json
+
+# Scratch markdown / text files only — track real docs (README.md, AGENTS.md,
+# CHANGELOG.md, etc.). Original blanket `*.md` and `*.txt` patterns silently
+# blocked all documentation from being added to the repo.
+scratch-*.md
+scratch-*.txt
+.notes/
+backend/config/models.local.json

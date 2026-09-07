@@ -66,6 +66,81 @@
 
         <!-- Scrollable conversations section -->
         <div class="sidebar-conversations flex-grow-1">
+          <div class="sidebar-list-controls px-2 pt-2">
+            <v-text-field
+              v-model="conversationSearch"
+              density="compact"
+              variant="outlined"
+              hide-details
+              clearable
+              placeholder="Search conversations"
+              prepend-inner-icon="mdi-magnify"
+            />
+            <div class="d-flex align-center mt-1">
+              <v-menu location="bottom start">
+                <template v-slot:activator="{ props }">
+                  <v-btn
+                    v-bind="props"
+                    size="small"
+                    variant="text"
+                    class="text-none"
+                    :title="`Sort: ${activeConversationSortLabel}`"
+                  >
+                    <v-icon size="small" class="mr-1">mdi-sort</v-icon>
+                    <span class="text-caption">{{ activeConversationSortLabel }}</span>
+                    <v-icon size="x-small" class="ml-1">
+                      {{ conversationSortDir === 'desc' ? 'mdi-arrow-down' : 'mdi-arrow-up' }}
+                    </v-icon>
+                  </v-btn>
+                </template>
+                <v-list density="compact">
+                  <v-list-item
+                    v-for="opt in conversationSortOptions"
+                    :key="opt.key"
+                    :active="conversationSortKey === opt.key"
+                    @click="setConversationSort(opt.key)"
+                  >
+                    <v-list-item-title>{{ opt.label }}</v-list-item-title>
+                    <template v-slot:append>
+                      <v-icon v-if="conversationSortKey === opt.key" size="x-small">
+                        {{ conversationSortDir === 'desc' ? 'mdi-arrow-down' : 'mdi-arrow-up' }}
+                      </v-icon>
+                    </template>
+                  </v-list-item>
+                </v-list>
+              </v-menu>
+
+              <v-menu location="bottom start">
+                <template v-slot:activator="{ props }">
+                  <v-btn
+                    v-bind="props"
+                    size="small"
+                    variant="text"
+                    class="text-none"
+                    :color="conversationFormatFilter !== 'all' ? 'primary' : undefined"
+                    title="Filter"
+                  >
+                    <v-icon size="small" class="mr-1">mdi-filter-variant</v-icon>
+                    <span class="text-caption">Filter</span>
+                  </v-btn>
+                </template>
+                <v-list density="compact">
+                  <v-list-subheader class="text-caption">Format</v-list-subheader>
+                  <v-list-item
+                    v-for="opt in conversationFilterOptions"
+                    :key="opt.value"
+                    :active="conversationFormatFilter === opt.value"
+                    @click="conversationFormatFilter = opt.value"
+                  >
+                    <v-list-item-title>{{ opt.label }}</v-list-item-title>
+                  </v-list-item>
+                </v-list>
+              </v-menu>
+
+              <v-spacer />
+              <span class="text-caption text-medium-emphasis mr-1">{{ conversations.length }}</span>
+            </div>
+          </div>
           <v-list density="compact" nav>
             <v-list-subheader>Conversations</v-list-subheader>
             
@@ -78,12 +153,22 @@
               @click="handleConversationClick(conversation.id)"
             >
               <template v-slot:title>
-                <div class="text-truncate">{{ conversation.title }}</div>
+                <div class="d-flex align-center">
+                  <div class="text-truncate flex-grow-1">{{ conversation.title }}</div>
+                  <v-badge
+                    v-if="getConversationUnreadCount(conversation.id) > 0"
+                    :content="getConversationUnreadCount(conversation.id)"
+                    color="warning"
+                    text-color="white"
+                    inline
+                    class="ml-1 sidebar-unread-badge"
+                  />
+                </div>
               </template>
               <template v-slot:subtitle>
                 <div>
                   <div class="text-caption" v-html="getConversationModelsHtml(conversation)"></div>
-                  <div class="text-caption text-medium-emphasis">{{ formatDate(conversation.updatedAt) }}</div>
+                  <div class="text-caption text-medium-emphasis">{{ conversationDateLabel(conversation) }}</div>
                 </div>
               </template>
               <template v-slot:append>
@@ -118,7 +203,14 @@
                     <v-list-item
                       prepend-icon="mdi-download"
                       title="Export"
+                      subtitle="Full conversation as JSON"
                       @click="exportConversation(conversation.id)"
+                    />
+                    <v-list-item
+                      prepend-icon="mdi-language-markdown-outline"
+                      title="Export as Markdown"
+                      subtitle="Readable transcript (.md)"
+                      @click="exportConversationMarkdown(conversation.id)"
                     />
                     <v-list-item
                       prepend-icon="mdi-content-copy"
@@ -130,6 +222,16 @@
                       title="Archive"
                       @click="archiveConversation(conversation.id)"
                     />
+                    <v-list-item
+                      prepend-icon="mdi-package-variant"
+                      title="Compact (reduce file size)"
+                      @click="compactConversation(conversation.id)"
+                    />
+                    <v-list-item
+                      prepend-icon="mdi-email-mark-as-unread"
+                      title="Mark as read"
+                      @click="markConversationAsRead(conversation)"
+                    />
                   </v-list>
                 </v-menu>
               </template>
@@ -137,11 +239,11 @@
           </v-list>
           
           <!-- Shared with me section -->
-          <v-list v-if="sharedConversations.length > 0" density="compact" nav class="mt-2">
+          <v-list v-if="filteredSharedConversations.length > 0" density="compact" nav class="mt-2">
             <v-list-subheader>Shared with me</v-list-subheader>
-            
+
             <v-list-item
-              v-for="share in sharedConversations"
+              v-for="share in filteredSharedConversations"
               :key="share.id"
               :to="`/conversation/${share.conversationId}`"
               class="conversation-list-item"
@@ -151,6 +253,14 @@
               <template v-slot:title>
                 <div class="d-flex align-center">
                   <div class="text-truncate flex-grow-1">{{ share.conversation?.title || 'Untitled' }}</div>
+                  <v-badge
+                    v-if="getConversationUnreadCount(share.conversationId) > 0"
+                    :content="getConversationUnreadCount(share.conversationId)"
+                    color="warning"
+                    text-color="white"
+                    inline
+                    class="ml-1 sidebar-unread-badge"
+                  />
                   <v-chip size="x-small" :color="getPermissionColor(share.permission)" class="ml-1">
                     {{ share.permission }}
                   </v-chip>
@@ -159,8 +269,8 @@
               <template v-slot:subtitle>
                 <div>
                   <div class="text-caption">from {{ share.sharedBy?.name || share.sharedBy?.email }}</div>
-                  <div class="text-caption text-medium-emphasis" v-if="share.conversation?.updatedAt">
-                    {{ formatDate(share.conversation.updatedAt) }}
+                  <div class="text-caption text-medium-emphasis">
+                    {{ sharedConversationDateLabel(share) }}
                   </div>
                 </div>
               </template>
@@ -229,7 +339,13 @@
                   title="Admin"
                   @click="$router.push('/admin')"
                 />
-                <v-divider v-if="isResearcher || isAdmin" class="my-1" />
+                <v-list-item
+                  v-if="rcUrl"
+                  prepend-icon="mdi-flask-outline"
+                  title="Connect to Research Commons"
+                  @click="connectToResearchCommons"
+                />
+                <v-divider v-if="isResearcher || isAdmin || rcUrl" class="my-1" />
                 <v-list-item
                   prepend-icon="mdi-logout"
                   title="Logout"
@@ -246,7 +362,7 @@
     <v-main
       v-if="!isMobile || mobilePanel === 'conversation'"
       class="d-flex flex-column"
-      style="height: 100vh;"
+      style="height: 100dvh;"
     >
       <!-- Top Bar -->
       <v-app-bar density="compact">
@@ -269,30 +385,72 @@
             {{ currentConversation.title || 'New Conversation' }}
           </div>
 
-          <!-- Scrollable bookmarks section -->
-          <div v-if="bookmarksInActivePath.length > 0" class="d-flex align-center bookmarks-scroll-container">
-            <v-icon icon="mdi-map-marker-right" size="small" class="mx-0" />
-            <div ref="bookmarksScrollRef" class="bookmarks-scroll">
-              <div class="d-flex align-center">
-                <template v-for="(bookmark, index) in bookmarksInActivePath" :key="bookmark.id">
-                  <span
-                    :ref="el => bookmarkRefs[index] = el as HTMLElement"
-                    class="bookmark-item cursor-pointer"
-                    :class="{ 'bookmark-current': index === currentBookmarkIndex }"
-                    @click="scrollToMessage(bookmark.messageId)"
-                  >
-                    {{ bookmark.label }}
-                  </span>
-                  <v-icon
-                    v-if="index < bookmarksInActivePath.length - 1"
-                    icon="mdi-chevron-right"
-                    size="small"
-                    class="mx-0"
-                    :style="{ opacity: index < currentBookmarkIndex ? 0.4 : 1 }"
-                  />
-                </template>
+          <!-- Bookmark navigation section - shows if there are any bookmarks in the tree -->
+          <div v-if="bookmarks.length > 0" ref="bookmarkBarRef" class="d-flex align-center bookmarks-scroll-container">
+            <!-- Bookmark browser dropdown (using map marker icon) -->
+            <v-menu location="bottom start" :close-on-content-click="true" max-height="400" :width="bookmarkDropdownWidth">
+              <template v-slot:activator="{ props }">
+                <v-icon
+                  v-bind="props"
+                  icon="mdi-map-marker-right"
+                  size="small"
+                  class="bookmark-browser-btn cursor-pointer"
+                  :title="`Browse all bookmarks (${bookmarks.length})`"
+                />
+              </template>
+              <v-list density="compact" class="bookmark-browser-list">
+                <v-list-subheader>All Bookmarks ({{ bookmarks.length }})</v-list-subheader>
+                <v-list-item
+                  v-for="bookmark in allBookmarksWithPreviews"
+                  :key="bookmark.id"
+                  @click="navigateToBookmark(bookmark.messageId, bookmark.branchId)"
+                  :class="{ 'bookmark-in-path': isBookmarkInActivePath(bookmark) }"
+                >
+                  <template v-slot:prepend>
+                    <v-icon size="small" :color="isBookmarkInActivePath(bookmark) ? 'primary' : bookmark.participantColor">
+                      {{ bookmark.role === 'user' ? 'mdi-account' : 'mdi-robot' }}
+                    </v-icon>
+                  </template>
+                  <v-list-item-title class="font-weight-medium d-flex align-center flex-wrap" style="gap: 4px 8px;">
+                    <span>{{ bookmark.label }}</span>
+                    <span class="text-caption" :style="`color: ${bookmark.participantColor}; opacity: 0.8;`">
+                      {{ bookmark.participantName }}
+                    </span>
+                    <span v-if="bookmark.modelName" class="text-caption meta-text">
+                      {{ bookmark.modelName }}
+                    </span>
+                  </v-list-item-title>
+                  <v-list-item-subtitle class="text-caption bookmark-preview">
+                    {{ bookmark.preview }}
+                  </v-list-item-subtitle>
+                </v-list-item>
+              </v-list>
+            </v-menu>
+
+            <!-- Path indicator and scrollable bookmarks in active path -->
+            <template v-if="bookmarksInActivePath.length > 0">
+              <div ref="bookmarksScrollRef" class="bookmarks-scroll">
+                <div class="d-flex align-center">
+                  <template v-for="(bookmark, index) in bookmarksInActivePath" :key="bookmark.id">
+                    <span
+                      :ref="el => bookmarkRefs[index] = el as HTMLElement"
+                      class="bookmark-item cursor-pointer"
+                      :class="{ 'bookmark-current': index === currentBookmarkIndex }"
+                      @click="scrollToMessage(bookmark.messageId)"
+                    >
+                      {{ bookmark.label }}
+                    </span>
+                    <v-icon
+                      v-if="index < bookmarksInActivePath.length - 1"
+                      icon="mdi-chevron-right"
+                      size="small"
+                      class="mx-0"
+                      :style="{ opacity: index < currentBookmarkIndex ? 0.4 : 1 }"
+                    />
+                  </template>
+                </div>
               </div>
-            </div>
+            </template>
           </div>
         </div>
 
@@ -328,51 +486,105 @@
           @click="treeDrawer = !treeDrawer"
           title="Toggle conversation tree"
         />
+
+        <!-- History button with unread badge -->
+        <v-badge
+          v-if="currentConversation"
+          :content="unreadBranchCount"
+          :model-value="unreadBranchCount > 0"
+          color="warning"
+          text-color="white"
+          offset-x="12"
+          offset-y="10"
+          class="unread-history-badge"
+        >
+          <v-btn
+            :icon="showEventHistory ? 'mdi-history' : 'mdi-history'"
+            :color="showEventHistory ? 'primary' : undefined"
+            variant="text"
+            @click.stop="showEventHistory = !showEventHistory"
+            title="Event history"
+          />
+        </v-badge>
       </v-app-bar>
 
-      <!-- Messages Area -->
-      <v-container
-        ref="messagesContainer"
-        class="flex-grow-1 overflow-y-auto messages-container"
-        style="max-height: calc(100vh - 160px);"
-      >
-        <div v-if="!currentConversation" class="text-center mt-12">
-          <v-icon size="64" color="grey">mdi-message-text-outline</v-icon>
-          <h2 class="text-h5 mt-4 text-grey">Select or create a conversation to start</h2>
-        </div>
+      <!-- Messages Area with Event History Panel -->
+      <div class="d-flex flex-grow-1 overflow-hidden">
+        <v-container
+          ref="messagesContainer"
+          class="flex-grow-1 overflow-y-auto messages-container"
+          style="max-height: calc(100dvh - 160px);"
+        >
+          <div v-if="!currentConversation && !isLoadingConversation" class="text-center mt-12">
+            <v-icon size="64" color="grey">mdi-message-text-outline</v-icon>
+            <h2 class="text-h5 mt-4 text-grey">Select or create a conversation to start</h2>
+          </div>
+          
+          <!-- Loading spinner while conversation is being fetched -->
+          <div v-else-if="isLoadingConversation" class="text-center mt-12">
+            <v-progress-circular
+              indeterminate
+              color="primary"
+              size="64"
+            />
+            <h2 class="text-h6 mt-4 text-grey-lighten-1">Loading conversation...</h2>
+          </div>
+          
+          <div v-else>
+            <template v-for="(group, groupIndex) in groupedMessages" :key="group.id">
+              <div
+                v-if="showContextDivider && groupIndex === firstInWindowGroupIndex"
+                class="context-window-divider"
+                :title="contextPreview && contextPreview.current.droppedFromHistory > 0
+                  ? `${contextPreview.current.droppedFromHistory} earlier message(s) are outside the rolling window and not sent to the model.`
+                  : 'Rolling context window starts here.'"
+              >
+                <span class="context-window-divider-label">context window</span>
+              </div>
+              <CompositeMessageGroup
+              :messages="group.messages"
+              :participants="participants"
+              :is-last-group="groupIndex === groupedMessages.length - 1"
+              :selected-branch-for-parent="selectedBranchForParent"
+              :streaming-message-id="streamingMessageId"
+              :streaming-branch-id="streamingBranchId"
+              :is-streaming="isStreaming"
+              :streaming-error="streamingError"
+              :post-hoc-affected-messages="postHocAffectedMessages"
+              :show-stuck-button="showStuckButton"
+              :authenticity-map="authenticityMap"
+              @regenerate="regenerateMessage"
+              @stuck-clicked="stuckDialog = true"
+              @edit="editMessage"
+              @edit-only="editMessageOnly"
+              @switch-branch="switchBranch"
+              @delete="deleteMessage"
+              @delete-all-branches="deleteAllBranches"
+              @select-as-parent="selectBranchAsParent"
+              @stop-auto-scroll="stopAutoScroll"
+              @bookmark-changed="handleBookmarkChanged"
+              @post-hoc-hide="handlePostHocHide"
+              @post-hoc-edit="handlePostHocEdit"
+              @post-hoc-edit-content="handlePostHocEditContent"
+              @post-hoc-hide-before="handlePostHocHideBefore"
+              @post-hoc-unhide="handlePostHocUnhide"
+              @delete-post-hoc-operation="handleDeletePostHocOperation"
+              @split="handleSplit"
+              @fork="handleFork"
+            />
+            </template>
+          </div>
+        </v-container>
         
-        <div v-else>
-          <MessageComponent
-            v-for="(message, index) in messages"
-            :id="`message-${message.id}`"
-            :key="message.id"
-            :message="message"
-            :participants="participants"
-            :is-selected-parent="selectedBranchForParent?.messageId === message.id &&
-                                 selectedBranchForParent?.branchId === message.activeBranchId"
-            :is-last-message="index === messages.length - 1"
-            :is-streaming="isStreaming && message.id === streamingMessageId"
-            :has-error="streamingError?.messageId === message.id"
-            :error-message="streamingError?.messageId === message.id ? streamingError.error : undefined"
-            :error-suggestion="streamingError?.messageId === message.id ? streamingError.suggestion : undefined"
-            :post-hoc-affected="postHocAffectedMessages.get(message.id)"
-            @regenerate="regenerateMessage"
-            @edit="editMessage"
-            @switch-branch="switchBranch"
-            @delete="deleteMessage"
-            @delete-all-branches="deleteAllBranches"
-            @select-as-parent="selectBranchAsParent"
-            @stop-auto-scroll="stopAutoScroll"
-            @bookmark-changed="handleBookmarkChanged"
-            @post-hoc-hide="handlePostHocHide"
-            @post-hoc-edit="handlePostHocEdit"
-            @post-hoc-edit-content="handlePostHocEditContent"
-            @post-hoc-hide-before="handlePostHocHideBefore"
-            @post-hoc-unhide="handlePostHocUnhide"
-            @delete-post-hoc-operation="handleDeletePostHocOperation"
-          />
-        </div>
-      </v-container>
+        <!-- Event History Panel -->
+        <EventHistoryPanel
+          v-if="showEventHistory && currentConversation"
+          :conversation-id="currentConversation.id"
+          :is-mobile="isMobile"
+          @close="showEventHistory = false"
+          @navigate-to-message="handleEventNavigate"
+        />
+      </div>
 
       <!-- Input Area -->
       <v-container v-if="currentConversation" class="pa-4" style="padding-top: 0 !important">
@@ -399,8 +611,11 @@
             :disabled="isStreaming"
             :single-model="currentModel"
             :is-standard-conversation="currentConversation.format === 'standard'"
+            :no-response-mode="noResponseMode"
             class="mb-2"
             @select-responder="(p) => selectedResponder = p.id"
+            @deselect-responder="selectedResponder = ''"
+            @toggle-no-response="noResponseMode = !noResponseMode"
             @quick-send="triggerParticipantResponse"
             @add-model="handleAddModel"
             @add-suggested-model="triggerModelResponse"
@@ -419,7 +634,10 @@
             :disabled="isStreaming"
             :single-model="currentModel"
             :is-standard-conversation="currentConversation.format === 'standard'"
+            :no-response-mode="noResponseMode"
             @select-responder="(p) => selectedResponder = p.id"
+            @deselect-responder="selectedResponder = ''"
+            @toggle-no-response="noResponseMode = !noResponseMode"
             @quick-send="triggerParticipantResponse"
             @add-model="handleAddModel"
             @add-suggested-model="triggerModelResponse"
@@ -505,17 +723,39 @@
             <span class="text-body-1 mt-2">Drop files here</span>
           </div>
           
+          <!-- Connection status indicator -->
+          <div v-if="wsConnectionState !== 'connected'" class="connection-status-bar mb-2">
+            <v-icon 
+              size="small" 
+              :color="wsConnectionState === 'reconnecting' ? 'warning' : 'error'"
+              class="mr-2"
+            >
+              {{ wsConnectionState === 'reconnecting' ? 'mdi-wifi-refresh' : 'mdi-wifi-off' }}
+            </v-icon>
+            <span class="text-caption">
+              {{ wsConnectionState === 'connecting' ? 'Connecting...' : 
+                 wsConnectionState === 'reconnecting' ? 'Reconnecting...' :
+                 wsConnectionState === 'failed' ? 'Connection failed. Please refresh the page.' :
+                 'Disconnected' }}
+            </span>
+          </div>
+          
+          <div v-if="contextRollWarning" class="context-roll-warning">
+            <v-icon size="x-small" class="mr-1">mdi-information-outline</v-icon>
+            <span class="text-caption">{{ contextRollWarning }}</span>
+          </div>
+
           <v-textarea
             ref="messageTextarea"
             v-model="messageInput"
             :label="typingIndicatorLabel"
-            placeholder="Type your message..."
+            :placeholder="messageInputPlaceholder"
             rows="1"
             auto-grow
             max-rows="15"
             variant="outlined"
             hide-details
-            @keydown.enter.exact.prevent="sendMessage"
+            @keydown.enter="handleMessageEnterKey"
             @focus="handleTextareaFocus"
             @paste="handlePaste"
             @input="handleTypingInput"
@@ -524,139 +764,152 @@
           <!-- Bottom control row -->
           <div class="bottom-controls d-flex align-center mt-2">
             <!-- Left side controls -->
-            <v-btn
-              icon="mdi-paperclip"
-              size="small"
-              variant="text"
-              color="grey"
-              @click.stop="triggerFileInput($event)"
-              title="Attach file"
-            />
-            
-            <!-- Hidden from AI toggle (for multiuser) -->
-            <v-btn
-              v-if="isMultiuserConversation"
-              :color="hiddenFromAi ? 'warning' : 'grey'"
-              size="small"
-              :variant="hiddenFromAi ? 'tonal' : 'text'"
-              @click.stop="hiddenFromAi = !hiddenFromAi"
-              title="Hide this message from AI"
-              class="ml-1"
-            >
-              <v-icon size="small">mdi-eye-off</v-icon>
-            </v-btn>
-            
-            <!-- Speaking as dropdown (for multi-participant) -->
-            <v-menu v-if="currentConversation?.format !== 'standard'" location="top">
-              <template v-slot:activator="{ props }">
-                <v-btn
-                  v-bind="props"
-                  size="small"
-                  variant="text"
-                  color="grey"
-                  class="ml-1 text-none"
-                >
-                  <v-icon size="small" class="mr-1">mdi-account</v-icon>
-                  <span class="text-caption">Speaking as: {{ selectedParticipantName }}</span>
-                  <v-icon size="x-small" class="ml-1">mdi-chevron-down</v-icon>
-                </v-btn>
-              </template>
-              <v-list density="compact">
-                <v-list-item
-                  v-for="participant in allParticipants"
-                  :key="participant.id"
-                  @click="selectedParticipant = participant.id"
-                  :active="selectedParticipant === participant.id"
-                >
-                  <template v-slot:prepend>
-                    <v-icon 
-                      :icon="participant.type === 'user' ? 'mdi-account' : 'mdi-robot'"
-                      :color="participant.type === 'user' ? '#bb86fc' : getModelColor(participant.model || '')"
-                      size="small"
-                    />
-                  </template>
-                  <v-list-item-title :style="`color: ${participant.type === 'user' ? '#bb86fc' : getModelColor(participant.model || '')}`">
-                    {{ participant.name }}
-                  </v-list-item-title>
-                </v-list-item>
-              </v-list>
-            </v-menu>
+            <div class="d-flex align-center input-bar-left">
+              <v-btn
+                icon="mdi-paperclip"
+                size="small"
+                variant="text"
+                color="grey"
+                @click.stop="triggerFileInput($event)"
+                title="Attach file"
+              />
+              
+              <!-- Hidden from AI toggle (for multiuser) -->
+              <v-btn
+                v-if="isMultiuserConversation"
+                icon="mdi-eye-off"
+                :color="hiddenFromAi ? 'warning' : 'grey'"
+                size="small"
+                :variant="hiddenFromAi ? 'tonal' : 'text'"
+                @click.stop="hiddenFromAi = !hiddenFromAi"
+                title="Hide this message from AI"
+              />
+              
+              <!-- Speaking as dropdown (for multi-participant) -->
+              <v-menu v-if="currentConversation?.format !== 'standard'" location="top">
+                <template v-slot:activator="{ props }">
+                  <v-btn
+                    v-bind="props"
+                    size="small"
+                    variant="text"
+                    color="grey"
+                    class="text-none"
+                  >
+                    <v-icon size="small" class="mr-1">mdi-account</v-icon>
+                    <span class="text-caption">Speaking as: {{ selectedParticipantName }}</span>
+                    <v-icon size="x-small" class="ml-1">mdi-chevron-down</v-icon>
+                  </v-btn>
+                </template>
+                <v-list density="compact">
+                  <v-list-item
+                    v-for="participant in allParticipants"
+                    :key="participant.id"
+                    @click="selectedParticipant = participant.id"
+                    :active="selectedParticipant === participant.id"
+                  >
+                    <template v-slot:prepend>
+                      <v-icon 
+                        :icon="participant.type === 'user' ? 'mdi-account' : 'mdi-robot'"
+                        :color="participant.type === 'user' ? '#bb86fc' : getModelColor(participant.model || '')"
+                        size="small"
+                      />
+                    </template>
+                    <v-list-item-title :style="`color: ${participant.type === 'user' ? '#bb86fc' : getModelColor(participant.model || '')}`">
+                      {{ participant.name }}
+                    </v-list-item-title>
+                  </v-list-item>
+                </v-list>
+              </v-menu>
+            </div>
             
             <v-spacer />
             
-            <!-- Right side controls -->
-            <!-- Thinking toggle -->
-            <v-btn
-              v-if="modelSupportsThinking"
-              icon="mdi-head-lightbulb"
-              :color="thinkingEnabled ? 'info' : 'grey'"
-              size="small"
-              :variant="thinkingEnabled ? 'tonal' : 'text'"
-              @click.stop="toggleThinking"
-              :title="thinkingEnabled ? 'Disable extended thinking' : 'Enable extended thinking'"
-            />
-            
-            <!-- Sampling branches -->
-            <v-menu location="top">
-              <template v-slot:activator="{ props }">
-                <v-btn
-                  v-bind="props"
-                  size="small"
-                  :variant="samplingBranches > 1 ? 'tonal' : 'text'"
-                  :color="samplingBranches > 1 ? 'secondary' : 'grey'"
-                  class="ml-1"
-                  :title="`Generate ${samplingBranches} response${samplingBranches > 1 ? 's' : ''}`"
-                >
-                  <v-icon size="small" class="mr-1">mdi-source-branch</v-icon>
-                  <span v-if="samplingBranches > 1" class="text-caption">{{ samplingBranches }}</span>
-                </v-btn>
-              </template>
-              <v-list density="compact" class="pa-0">
-                <v-list-subheader class="text-caption">Response samples</v-list-subheader>
-                <v-list-item
-                  v-for="n in 8"
-                  :key="n"
-                  :active="samplingBranches === n"
-                  @click="samplingBranches = n"
-                >
-                  <v-list-item-title>{{ n }}{{ n > 1 ? ' branches' : '' }}</v-list-item-title>
-                </v-list-item>
-              </v-list>
-            </v-menu>
-            
-            <!-- Settings -->
-            <v-btn
-              icon="mdi-cog-outline"
-              size="small"
-              variant="text"
-              color="grey"
-              @click.stop="conversationSettingsDialog = true"
-              title="Conversation settings"
-              class="ml-1"
-            />
-            
-            <!-- Send/Stop button -->
-            <v-btn
-              v-if="!isStreaming"
-              :disabled="!messageInput"
-              color="primary"
-              icon="mdi-send"
-              variant="flat"
-              size="small"
-              style="touch-action: manipulation;"
-              class="ml-2"
-              @click="sendMessage"
-            />
-            <v-btn
-              v-else
-              color="error"
-              icon="mdi-stop"
-              variant="flat"
-              size="small"
-              title="Stop generation"
-              class="ml-2"
-              @click="abortGeneration"
-            />
+            <!-- Right side controls - consistent icon buttons -->
+            <div class="d-flex align-center input-bar-right">
+              <!-- Thinking toggle -->
+              <v-btn
+                v-if="modelSupportsThinking"
+                icon="mdi-head-lightbulb"
+                :color="thinkingEnabled ? 'info' : 'grey'"
+                size="small"
+                :variant="thinkingEnabled ? 'tonal' : 'text'"
+                @click.stop="toggleThinking"
+                :title="thinkingEnabled ? 'Disable extended thinking' : 'Enable extended thinking'"
+              />
+              
+              <!-- Detached branch mode toggle (for multi-user independent browsing) -->
+              <v-btn
+                v-if="isCollaborativeConversation"
+                :icon="isDetachedFromMainBranch ? 'mdi-link-off' : 'mdi-link'"
+                :color="isDetachedFromMainBranch ? 'warning' : 'grey'"
+                size="small"
+                :variant="isDetachedFromMainBranch ? 'tonal' : 'text'"
+                @click.stop="toggleDetachedMode"
+                :title="isDetachedFromMainBranch ? 'Detached: Branch navigation is local-only. Click to follow main branch.' : 'Following main branch. Click to browse independently.'"
+              />
+              
+              <!-- Sampling branches -->
+              <v-menu location="top">
+                <template v-slot:activator="{ props }">
+                  <v-btn
+                    v-bind="props"
+                    size="small"
+                    :variant="samplingBranches > 1 ? 'tonal' : 'text'"
+                    :color="samplingBranches > 1 ? 'secondary' : 'grey'"
+                    :title="`Generate ${samplingBranches} response${samplingBranches > 1 ? 's' : ''}`"
+                    class="sampling-btn"
+                  >
+                    <v-icon size="small">mdi-source-branch</v-icon>
+                    <span v-if="samplingBranches > 1" class="sampling-count">{{ samplingBranches }}</span>
+                  </v-btn>
+                </template>
+                <v-list density="compact" class="pa-0">
+                  <v-list-subheader class="text-caption">Response samples</v-list-subheader>
+                  <v-list-item
+                    v-for="n in 8"
+                    :key="n"
+                    :active="samplingBranches === n"
+                    @click="samplingBranches = n"
+                  >
+                    <v-list-item-title>{{ n }}{{ n > 1 ? ' branches' : '' }}</v-list-item-title>
+                  </v-list-item>
+                </v-list>
+              </v-menu>
+              
+              <!-- Settings -->
+              <v-btn
+                icon="mdi-cog-outline"
+                size="small"
+                variant="text"
+                color="grey"
+                @click.stop="conversationSettingsDialog = true"
+                title="Conversation settings"
+              />
+              
+              <!-- Send/Stop button -->
+              <v-btn
+                v-if="!isStreaming"
+                :disabled="!messageInput || !isWsConnected"
+                :color="isWsConnected ? 'primary' : 'grey'"
+                icon="mdi-send"
+                variant="flat"
+                size="small"
+                style="touch-action: manipulation;"
+                class="ml-1"
+                :title="isWsConnected ? 'Send message' : 'Waiting for connection...'"
+                @click="sendMessage"
+              />
+              <v-btn
+                v-else
+                color="error"
+                icon="mdi-stop"
+                variant="flat"
+                size="small"
+                title="Stop generation"
+                class="ml-1"
+                @click="abortGeneration"
+              />
+            </div>
           </div>
         </div>
         
@@ -664,7 +917,7 @@
         <input
           ref="fileInput"
           type="file"
-          accept=".txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.java,.cpp,.c,.h,.hpp,.jpg,.jpeg,.png,.gif,.webp,.svg,.pdf,.mp3,.wav,.flac,.ogg,.m4a,.aac,.mp4,.mov,.avi,.mkv,.webm"
+          accept=".txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.java,.cpp,.c,.h,.hpp,.jpg,.jpeg,.png,.gif,.webp,.svg,.pdf,application/pdf,.mp3,.wav,.flac,.ogg,.m4a,.aac,.mp4,.mov,.avi,.mkv,.webm"
           multiple
           style="display: none"
           @change="handleFileSelect"
@@ -690,6 +943,7 @@
         :current-branch-id="currentBranchId"
         :selected-parent-message-id="selectedBranchForParent?.messageId"
         :selected-parent-branch-id="selectedBranchForParent?.branchId"
+        :read-branch-ids="store.state.readBranchIds"
         @navigate-to-branch="navigateToTreeBranch"
         class="flex-grow-1"
         style="overflow-y: hidden"
@@ -757,6 +1011,7 @@
     <AddParticipantDialog
       v-model="addParticipantDialog"
       :models="store.state.models"
+      :availability="store.state.modelAvailability"
       :personas="personas"
       :conversation-id="currentConversation?.id || ''"
       :is-standard-conversation="currentConversation?.format === 'standard'"
@@ -765,6 +1020,238 @@
       @add="handleAddParticipant"
     />
     
+    <!-- Content Blocked Dialog -->
+    <v-dialog v-model="contentBlockedDialog" max-width="600" persistent>
+      <v-card class="pa-4">
+        <v-card-title class="d-flex align-center text-h5">
+          <v-icon color="warning" class="mr-2">mdi-shield-alert</v-icon>
+          Content Moderation
+        </v-card-title>
+        
+        <v-card-text class="text-body-1">
+          <p class="mb-4">
+            Your message was flagged by our content moderation system. To protect Arc from potential 
+            legal liability and public relations risks, we filter certain categories of content on our hosted platform.
+          </p>
+          
+          <v-alert
+            v-if="contentBlockedData?.categories?.length"
+            type="warning"
+            variant="tonal"
+            density="compact"
+            class="mb-4"
+          >
+            <strong>Restriction category:</strong> {{ contentBlockedData.categories.join(', ') }}
+          </v-alert>
+          
+          <v-divider class="my-4" />
+          
+          <p class="mb-3"><strong>Options for unrestricted access:</strong></p>
+          
+          <v-list density="compact" class="bg-transparent">
+            <v-list-item lines="three">
+              <template v-slot:prepend>
+                <v-icon color="primary">mdi-account-check</v-icon>
+              </template>
+              <v-list-item-title>Request Researcher Access</v-list-item-title>
+              <v-list-item-subtitle class="text-wrap">
+                Join our Discord and request researcher access for legitimate research purposes. If you are in our Discord aleady, you most likely qualify.
+              </v-list-item-subtitle>
+            </v-list-item>
+            
+            <v-list-item lines="three">
+              <template v-slot:prepend>
+                <v-icon color="primary">mdi-github</v-icon>
+              </template>
+              <v-list-item-title>Self-Host Arc</v-list-item-title>
+              <v-list-item-subtitle class="text-wrap">
+                Download and run Arc locally for unrestricted use and privacy of data. The project is available on our GitHub. 
+              </v-list-item-subtitle>
+            </v-list-item>
+          </v-list>
+          
+          <v-divider class="my-4" />
+          
+          <p class="text-caption text-grey">
+            <v-icon size="small" class="mr-1">mdi-information-outline</v-icon>
+            Our filters are tuned to be permissive and should only trigger on severe content. 
+            If you believe this was flagged incorrectly, please let us know on Discord.
+          </p>
+        </v-card-text>
+        
+        <v-card-actions class="d-flex justify-end ga-2 px-4 pb-4">
+          <v-btn
+            variant="outlined"
+            href="https://discord.gg/anima"
+            target="_blank"
+          >
+            <v-icon start>mdi-discord</v-icon>
+            Discord
+          </v-btn>
+          <v-btn
+            variant="outlined"
+            href="https://github.com/anima-research/animachat"
+            target="_blank"
+          >
+            <v-icon start>mdi-github</v-icon>
+            GitHub
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            @click="contentBlockedDialog = false; contentBlockedData = null"
+          >
+            OK
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Stuck Generation Dialog -->
+    <v-dialog v-model="stuckDialog" max-width="550" persistent>
+      <v-card class="pa-4">
+        <v-card-title class="d-flex align-center text-h5">
+          <v-icon color="warning" class="mr-2">mdi-alert-circle</v-icon>
+          Generation Appears Stuck
+        </v-card-title>
+        
+        <v-card-text class="text-body-1">
+          <p class="mb-4">
+            The AI generation has been running for over a minute without producing any output. 
+            This is an intermittent issue we're investigating. Most likely it is related to real-time sync malfunctioning.
+          </p>
+          
+          <v-alert type="info" variant="tonal" density="compact" class="mb-4">
+            <strong>Help us fix this!</strong> Submitting diagnostics will help us identify the cause. 
+            This includes console logs from your browser session (no personal data).
+          </v-alert>
+          
+          <p class="text-body-2 text-grey">
+            After submitting, the page will reload to restore normal operation.
+          </p>
+        </v-card-text>
+        
+        <v-card-actions class="justify-end">
+          <v-btn
+            variant="text"
+            @click="dismissStuckDialog"
+          >
+            Just Reload
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            :loading="stuckAnalyticsSubmitting"
+            @click="submitStuckAnalytics"
+          >
+            <v-icon start>mdi-send</v-icon>
+            Submit Diagnostics & Reload
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+    
+    <!-- Fork Conversation Dialog -->
+    <v-dialog v-model="showForkDialog" max-width="560">
+      <v-card>
+        <v-card-title class="text-h6">
+          <v-icon start color="primary">mdi-source-fork</v-icon>
+          Fork to New Conversation
+        </v-card-title>
+        <v-card-text>
+          <p class="mb-4">
+            Create a new conversation starting from this message, including all branches below it.
+          </p>
+          
+          <div class="text-subtitle-2 mb-2">History handling:</div>
+          <v-radio-group v-model="forkMode" density="compact" hide-details class="mb-2">
+            <v-radio value="full" class="mb-1">
+              <template v-slot:label>
+                <div>
+                  <span class="font-weight-medium">Full</span>
+                  <span class="text-caption text-medium-emphasis ml-2">Copy all prior messages</span>
+                </div>
+              </template>
+            </v-radio>
+            <v-radio value="compressed" class="mb-1">
+              <template v-slot:label>
+                <div>
+                  <span class="font-weight-medium">Compressed</span>
+                  <span class="text-caption text-medium-emphasis ml-2">Embed history as invisible context</span>
+                </div>
+              </template>
+            </v-radio>
+            <v-radio value="truncated" class="mb-1">
+              <template v-slot:label>
+                <div>
+                  <span class="font-weight-medium">Truncated</span>
+                  <span class="text-caption text-medium-emphasis ml-2">Messages earlier than the fork point are discarded</span>
+                </div>
+              </template>
+            </v-radio>
+          </v-radio-group>
+          
+          <v-alert 
+            v-if="forkMode === 'full'" 
+            type="info" 
+            density="compact" 
+            variant="tonal"
+            class="text-caption"
+          >
+            All messages on the active path before this point will be copied as separate, editable messages.
+            The full subtree (including branches) is preserved.
+          </v-alert>
+          <v-alert 
+            v-if="forkMode === 'compressed'" 
+            type="info" 
+            density="compact" 
+            variant="tonal"
+            class="text-caption"
+          >
+            Prior messages are embedded as a part of the first message.
+            You'll only see messages from this point onwards. Use this when you want to reduce message count.
+          </v-alert>
+          <v-alert 
+            v-if="forkMode === 'truncated'" 
+            type="warning" 
+            density="compact" 
+            variant="tonal"
+            class="text-caption"
+          >
+            The AI will have no memory of the context before the fork point. Use when you want a remove earlier conversation history.
+          </v-alert>
+          
+          <v-divider class="my-3" />
+          
+          <v-checkbox
+            v-model="forkIncludePrivateBranches"
+            density="compact"
+            hide-details
+            class="mt-0"
+          >
+            <template v-slot:label>
+              <span class="text-body-2">Include my private branches</span>
+            </template>
+          </v-checkbox>
+          <div class="text-caption text-medium-emphasis ml-8 mt-n1">
+            Private branches are normally excluded from forks.
+          </div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showForkDialog = false" :disabled="forkIsLoading">
+            Cancel
+          </v-btn>
+          <v-btn color="primary" variant="elevated" @click="executeFork" :loading="forkIsLoading">
+            <v-icon start>mdi-source-fork</v-icon>
+            Fork
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+    
+    <!-- Stuck button is now shown inline next to the generating indicator in MessageComponent -->
+
     <!-- Error snackbar for non-streaming errors (pricing validation, etc.) -->
     <v-snackbar
       v-model="errorSnackbar"
@@ -786,18 +1273,19 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router';
 import { isEqual } from 'lodash-es';
-import { useStore } from '@/store';
+import { useStore, computeVisibleMessages } from '@/store';
 import { api } from '@/services/api';
-import type { Conversation, Message, Participant, Model, Bookmark, Persona } from '@deprecated-claude/shared';
+import type { Conversation, Message, Participant, Model, Bookmark, Persona, WsAttachment } from '@deprecated-claude/shared';
 import { UpdateParticipantSchema, getValidatedModelDefaults } from '@deprecated-claude/shared';
-import MessageComponent from '@/components/MessageComponent.vue';
+import CompositeMessageGroup from '@/components/CompositeMessageGroup.vue';
 import ImportDialogV2 from '@/components/ImportDialogV2.vue';
 import SettingsDialog from '@/components/SettingsDialog.vue';
 import ConversationSettingsDialog from '@/components/ConversationSettingsDialog.vue';
 import ShareDialog from '@/components/ShareDialog.vue';
 import CollaborationShareDialog from '@/components/CollaborationShareDialog.vue';
+import EventHistoryPanel from '@/components/EventHistoryPanel.vue';
 import ManageSharesDialog from '@/components/ManageSharesDialog.vue';
 import DuplicateConversationDialog from '@/components/DuplicateConversationDialog.vue';
 import ArcLogo from '@/components/ArcLogo.vue';
@@ -807,6 +1295,8 @@ import MetricsDisplay from '@/components/MetricsDisplay.vue';
 import ModelPillBar from '@/components/ModelPillBar.vue';
 import AddParticipantDialog from '@/components/AddParticipantDialog.vue';
 import { getModelColor } from '@/utils/modelColors';
+import { serializeConversationToMarkdown } from '@/utils/conversationMarkdown';
+import { computeAuthenticity, type AuthenticityStatus } from '@/utils/authenticity';
 
 const route = useRoute();
 const router = useRouter();
@@ -825,6 +1315,11 @@ const treeDrawer = ref(false);
 const importDialog = ref(false);
 const settingsDialog = ref(false);
 const conversationSettingsDialog = ref(false);
+// Tracks a conversation that was just created by "New Conversation" and is
+// still being configured in the auto-opened settings dialog. If that dialog
+// is dismissed without saving, the conversation was never really wanted, so
+// it gets cleaned up (see the conversationSettingsDialog watcher).
+const provisionalNewConversationId = ref<string | null>(null);
 const shareDialog = ref(false);
 const collaborationDialog = ref(false);
 const manageSharesDialog = ref(false);
@@ -833,14 +1328,53 @@ const duplicateConversationTarget = ref<Conversation | null>(null);
 const showRawImportDialog = ref(false);
 const welcomeDialog = ref(false);
 const addParticipantDialog = ref(false);
+const contentBlockedDialog = ref(false);
+const contentBlockedData = ref<{ reason?: string; categories?: string[] } | null>(null);
 const rawImportData = ref('');
 const messageInput = ref('');
 const personas = ref<Persona[]>([]);
 const isStreaming = ref(false);
 const streamingMessageId = ref<string | null>(null);
+const streamingBranchId = ref<string | null>(null);  // Track which branch is streaming
 const autoScrollEnabled = ref(true);
+const userScrolledRecently = ref(false);  // Prevents auto-scroll from fighting with user
+const isProgrammaticScroll = ref(false);  // Tracks when scroll is from code, not user
 const isSwitchingBranch = ref(false);
 const streamingError = ref<{ messageId: string; error: string; suggestion?: string } | null>(null);
+const isLoadingConversation = ref(false);
+
+// Research Commons integration
+const rcUrl = import.meta.env.VITE_RC_URL || '';
+
+// Track last completed branch to prevent re-triggering streaming on DEBUG CAPTURE updates
+const lastCompletedBranchId = ref<string | null>(null);
+const lastCompletedTime = ref<number | null>(null);
+
+// Stuck generation detection
+const streamingStartTime = ref<number | null>(null);
+const firstTokenReceived = ref(false);
+const lastContentReceivedTime = ref<number | null>(null); // Track when we last received any content
+const showStuckButton = ref(false);
+const stuckDialog = ref(false);
+const stuckAnalyticsSubmitting = ref(false);
+let stuckCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let contentStuckCheckTimer: ReturnType<typeof setTimeout> | null = null; // Secondary timer for "content but no completion"
+
+// Timeout for "content received but never completed" - used for image generation issues
+const CONTENT_STUCK_TIMEOUT_MS = 45000; // 45 seconds after last content with no completion
+
+// Get stuck threshold based on current model - Anthropic is faster to detect issues
+const getStuckThresholdMs = () => {
+  const model = currentConversation.value?.model || '';
+  const isAnthropic = model.includes('anthropic') || model.includes('claude');
+  return isAnthropic ? 15000 : 60000; // 15s for Anthropic, 60s for others
+};
+
+// Console log collection for debugging
+// IMPORTANT: Use a plain array, NOT a ref, to avoid reactivity loops
+// (console.log -> push to ref -> reactivity -> re-render -> console.log -> ...)
+let consoleLogs: string[] = [];
+const MAX_CONSOLE_LOGS = 200;
 
 // General error snackbar (for non-streaming errors like pricing validation)
 const errorSnackbar = ref(false);
@@ -854,14 +1388,28 @@ const activeAiRequest = ref<{ userId: string; messageId: string } | null>(null);
 const isAiRequestQueued = ref(false); // True if our request was queued because AI is already generating
 const hiddenFromAi = ref(false); // Toggle for sending messages hidden from AI
 const samplingBranches = ref(1); // Number of response branches to generate
+const showEventHistory = ref(false); // Toggle for event history panel
 
 // Computed: Check if this is a multiuser conversation (shared or has multiple users)
 const isMultiuserConversation = computed(() => {
-  // Show multiuser controls if there are multiple users in the room
-  // or if the conversation has collaborators (even if they're not currently online)
-  return roomUsers.value.length > 1 || sharedConversations.value.some(
-    s => s.conversationId === currentConversation.value?.id
-  );
+  // Show multiuser controls if:
+  // 1. Multiple users currently in room
+  // 2. Conversation was shared with me
+  // 3. I've shared this conversation publicly
+  // 4. This conversation has collaborators
+  const conversationId = currentConversation.value?.id;
+  if (!conversationId) return false;
+  
+  return roomUsers.value.length > 1 || 
+    sharedConversations.value.some(s => s.conversationId === conversationId) ||
+    myCreatedShares.value.some(s => s.conversationId === conversationId) ||
+    currentConversationCollaborators.value.length > 0;
+});
+
+const messageInputPlaceholder = computed(() => {
+  return isMobile.value
+    ? 'Type your message...'
+    : 'Type your message...  (Enter to send, Shift+Enter for newline)';
 });
 
 // Computed label for the input field - shows who is typing
@@ -919,21 +1467,86 @@ const messagesContainer = ref<HTMLElement>();
 const participants = ref<Participant[]>([]);
 const selectedParticipant = ref<string>('');
 const selectedResponder = ref<string>('');
+const noResponseMode = ref(false);  // For standard conversations: disable AI response
+const isLoadingUIState = ref(false); // Prevents saving during load
 const showMobileSpeakingAs = ref(false);
+
+// Fork dialog state
+const showForkDialog = ref(false);
+const forkTargetMessageId = ref('');
+const forkTargetBranchId = ref('');
+const forkMode = ref<'full' | 'compressed' | 'truncated'>('full');
+const forkIncludePrivateBranches = ref(false);
+const forkIsLoading = ref(false);
 const conversationTreeRef = ref<InstanceType<typeof ConversationTree>>();
 const bookmarks = ref<Bookmark[]>([]);
 const bookmarksScrollRef = ref<HTMLElement>();
+const bookmarkBarRef = ref<HTMLElement>();
 const bookmarkRefs = ref<HTMLElement[]>([]);
 const isUserScrollingBookmarks = ref(false);
 const currentBookmarkIndex = ref(0);
 
 // Sort conversations by updatedAt on the client side for real-time updates
+// --- Sidebar search / sort / filter (client-side, conversation metadata only) ---
+type ConversationSortKey = 'updated' | 'created' | 'title';
+const conversationSearch = ref('');
+const conversationSortKey = ref<ConversationSortKey>('updated');
+const conversationSortDir = ref<'asc' | 'desc'>('desc');
+const conversationFormatFilter = ref<'all' | 'standard' | 'group'>('all');
+
+const conversationSortOptions: { key: ConversationSortKey; label: string }[] = [
+  { key: 'updated', label: 'Last updated' },
+  { key: 'created', label: 'Date created' },
+  { key: 'title', label: 'Title' }
+];
+const conversationFilterOptions: { value: 'all' | 'standard' | 'group'; label: string }[] = [
+  { value: 'all', label: 'All conversations' },
+  { value: 'standard', label: 'One-on-one' },
+  { value: 'group', label: 'Group' }
+];
+
+function setConversationSort(key: ConversationSortKey) {
+  if (conversationSortKey.value === key) {
+    conversationSortDir.value = conversationSortDir.value === 'desc' ? 'asc' : 'desc';
+  } else {
+    conversationSortKey.value = key;
+    // Sensible default direction per key: newest-first for dates, A–Z for title.
+    conversationSortDir.value = key === 'title' ? 'asc' : 'desc';
+  }
+}
+
+const activeConversationSortLabel = computed(
+  () => conversationSortOptions.find(o => o.key === conversationSortKey.value)?.label ?? 'Sort'
+);
+
+// Date shown on each row follows the active sort key, so "what am I sorted by"
+// is always legible (title sort falls back to last-updated).
+function conversationDateLabel(c: { createdAt: string | Date; updatedAt: string | Date }): string {
+  if (conversationSortKey.value === 'created') return `created ${formatDate(c.createdAt)}`;
+  return `updated ${formatDate(c.updatedAt)}`;
+}
+
 const conversations = computed(() => {
-  return [...store.state.conversations].sort((a, b) => {
-    const dateA = new Date(a.updatedAt).getTime();
-    const dateB = new Date(b.updatedAt).getTime();
-    return dateB - dateA; // Most recent first
-  });
+  const q = conversationSearch.value.trim().toLowerCase();
+  const fmt = conversationFormatFilter.value;
+  const dir = conversationSortDir.value === 'desc' ? -1 : 1;
+  const key = conversationSortKey.value;
+
+  return [...store.state.conversations]
+    .filter(c => {
+      if (q && !(c.title || '').toLowerCase().includes(q)) return false;
+      if (fmt === 'standard' && c.format !== 'standard') return false;
+      if (fmt === 'group' && c.format === 'standard') return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (key === 'title') {
+        return (a.title || '').localeCompare(b.title || '') * dir;
+      }
+      const da = new Date(key === 'created' ? a.createdAt : a.updatedAt).getTime();
+      const db = new Date(key === 'created' ? b.createdAt : b.updatedAt).getTime();
+      return (da - db) * dir;
+    });
 });
 
 // Shared conversations (from other users)
@@ -947,12 +1560,97 @@ interface SharedConversationEntry {
 }
 const sharedConversations = ref<SharedConversationEntry[]>([]);
 
+// The same sidebar search/sort/filter controls apply to "Shared with me". For
+// shared rows, "Date created" is interpreted as `share.createdAt` (when the
+// share landed in the recipient's list) rather than the conversation's own
+// createdAt, which isn't sent over the wire for shares. That's the more
+// useful semantic for the recipient anyway ("newest shares first").
+const filteredSharedConversations = computed(() => {
+  const q = conversationSearch.value.trim().toLowerCase();
+  const fmt = conversationFormatFilter.value;
+  const dir = conversationSortDir.value === 'desc' ? -1 : 1;
+  const key = conversationSortKey.value;
+
+  return [...sharedConversations.value]
+    .filter(s => {
+      const title = s.conversation?.title || '';
+      if (q && !title.toLowerCase().includes(q)) return false;
+      const format = s.conversation?.format;
+      if (fmt === 'standard' && format !== 'standard') return false;
+      if (fmt === 'group' && format === 'standard') return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (key === 'title') {
+        return (a.conversation?.title || '').localeCompare(b.conversation?.title || '') * dir;
+      }
+      // 'created' uses the share's createdAt (when received); 'updated' uses
+      // the conversation's updatedAt with a safe fallback.
+      const pickDate = (s: SharedConversationEntry) =>
+        key === 'created' ? s.createdAt : (s.conversation?.updatedAt || s.createdAt);
+      return (new Date(pickDate(a)).getTime() - new Date(pickDate(b)).getTime()) * dir;
+    });
+});
+
+// Row date for shared conversations, mirroring `conversationDateLabel` but
+// labeling the 'created' case as "received {date}" — clearer for shares.
+// `s.createdAt` is typed as string but populated from API response; guard
+// against missing values to match the conditional-render intent the
+// pre-PR-#105 template had (Greptile #105 catch).
+function sharedConversationDateLabel(s: SharedConversationEntry): string {
+  if (conversationSortKey.value === 'created') {
+    return s.createdAt ? `received ${formatDate(s.createdAt)}` : '';
+  }
+  if (s.conversation?.updatedAt) return `updated ${formatDate(s.conversation.updatedAt)}`;
+  return s.createdAt ? `received ${formatDate(s.createdAt)}` : '';
+}
+
+// Shares created by the current user (for owner to know their conversation is shared)
+interface MyCreatedShare {
+  conversationId: string;
+  // Add other fields as needed
+}
+const myCreatedShares = ref<MyCreatedShare[]>([]);
+
+// Collaboration shares for the current conversation (user-to-user sharing)
+interface CollaborationShare {
+  id: string;
+  recipientId: string;
+  permission: string;
+}
+const currentConversationCollaborators = ref<CollaborationShare[]>([]);
+
 async function loadSharedConversations() {
   try {
     const response = await api.get('/collaboration/shared-with-me');
     sharedConversations.value = response.data.shares || [];
   } catch (error) {
     console.error('Failed to load shared conversations:', error);
+  }
+}
+
+async function loadMyCreatedShares() {
+  try {
+    const response = await api.get('/shares/my-shares');
+    myCreatedShares.value = response.data || [];
+  } catch (error) {
+    console.error('Failed to load my created shares:', error);
+  }
+}
+
+async function loadCurrentConversationCollaborators() {
+  const conversationId = currentConversation.value?.id;
+  if (!conversationId) {
+    currentConversationCollaborators.value = [];
+    return;
+  }
+  
+  try {
+    const response = await api.get(`/collaboration/conversation/${conversationId}/shares`);
+    currentConversationCollaborators.value = response.data.shares || [];
+  } catch (error) {
+    // User might not have access or conversation doesn't exist
+    currentConversationCollaborators.value = [];
   }
 }
 
@@ -979,6 +1677,70 @@ const currentConversation = computed(() => store.state.currentConversation);
 const messages = computed(() => store.messages);
 const allMessages = computed(() => store.state.allMessages); // Get ALL messages for tree view
 
+// STUBBED: Unread count disabled pending architecture review
+const unreadBranchCount = computed(() => 0);
+
+// Legacy unread count (kept for backwards compatibility)
+const unreadCount = computed(() => store.getUnreadCount());
+
+// Compute authenticity for visible messages
+const authenticityMap = computed((): Map<string, AuthenticityStatus> => {
+  return computeAuthenticity(messages.value, participants.value);
+});
+
+// Group consecutive messages from the same participant for visual combining
+interface MessageGroup {
+  id: string;
+  messages: any[]; // Message[]
+  participantName: string;
+}
+
+const groupedMessages = computed((): MessageGroup[] => {
+  const msgs = messages.value;
+  if (!msgs || msgs.length === 0) return [];
+  
+  const groups: MessageGroup[] = [];
+  let currentGroup: MessageGroup | null = null;
+  
+  for (const message of msgs) {
+    const branch = message.branches?.find((b: any) => b.id === message.activeBranchId);
+    if (!branch) continue;
+    
+    // Get participant name
+    let participantName = branch.role === 'user' ? 'User' : 'Assistant';
+    if (branch.participantId) {
+      const participant = participants.value.find(p => p.id === branch.participantId);
+      if (participant) {
+        participantName = participant.name;
+      }
+    }
+    
+    // Check if this continues the current group
+    if (currentGroup && currentGroup.participantName === participantName && participantName !== '') {
+      currentGroup.messages.push(message);
+    } else {
+      // Start a new group
+      if (currentGroup) {
+        groups.push(currentGroup);
+      }
+      currentGroup = {
+        id: `group-${message.id}`,
+        messages: [message],
+        participantName
+      };
+    }
+  }
+  
+  // Don't forget the last group
+  if (currentGroup) {
+    groups.push(currentGroup);
+  }
+  
+  return groups;
+});
+const wsConnectionState = computed(() => store.state.wsConnectionState);
+const isWsConnected = computed(() => store.state.wsConnectionState === 'connected');
+
 // Compute which messages are affected by post-hoc operations
 // IMPORTANT: Only consider operations that are on the CURRENT visible branch path
 const postHocAffectedMessages = computed(() => {
@@ -996,11 +1758,13 @@ const postHocAffectedMessages = computed(() => {
     const activeBranch = msg.branches.find((b: any) => b.id === msg.activeBranchId);
     if (activeBranch?.postHocOperation) {
       operations.push({ order: msg.order, op: activeBranch.postHocOperation });
-      console.log('[PostHoc] Found visible operation:', activeBranch.postHocOperation.type, 'targeting:', activeBranch.postHocOperation.targetMessageId);
     }
   }
   
-  console.log('[PostHoc] Visible messages:', visibleMsgs.length, 'Operations found:', operations.length);
+  // Debug logging only when there are operations (computed runs frequently)
+  if (operations.length > 0) {
+    console.log('[PostHoc] Found operations:', operations.length);
+  }
   
   if (operations.length === 0) return affected;
   
@@ -1130,6 +1894,87 @@ const currentBranchId = computed(() => {
 });
 const currentModel = computed(() => store.currentModel);
 
+// --- Rolling-context preview (dashed divider + pre-send "context rolls" warning) ---
+interface ContextPreview {
+  strategy: 'append' | 'rolling';
+  current: { firstInWindowMessageId: string | null; droppedFromHistory: number };
+  prospective?: { wouldRotate: boolean; droppedCount: number; droppedMessageIds: string[]; wouldTriggerCompaction: boolean };
+}
+const contextPreview = ref<ContextPreview | null>(null);
+let contextPreviewDebounce: number | null = null;
+
+async function refreshContextPreview(draft?: string) {
+  const conv = currentConversation.value;
+  if (!conv) { contextPreview.value = null; return; }
+  // Only run when the rolling strategy is in play — append mode has no
+  // rotation and therefore nothing to render. Precedence mirrors backend
+  // ContextManager: responder participant overrides conversation default.
+  const responderParticipant = selectedResponder.value
+    ? participants.value.find(p => p.id === selectedResponder.value)
+    : participants.value.find(p => p.type === 'assistant');
+  const strategy = responderParticipant?.contextManagement?.strategy
+    ?? conv.contextManagement?.strategy
+    ?? 'append';
+  if (strategy !== 'rolling') { contextPreview.value = null; return; }
+  try {
+    const responderId = selectedResponder.value
+      || participants.value.find(p => p.type === 'assistant')?.id
+      || undefined;
+    const { data } = await api.post(`/conversations/${conv.id}/context-preview`, {
+      branchId: currentBranchId.value,
+      participantId: responderId,
+      draftContent: draft && draft.length > 0 ? draft : undefined
+    });
+    contextPreview.value = data;
+  } catch (e) {
+    // Silent fail — preview is purely informational; don't disrupt the user.
+    console.debug('[ContextPreview] refresh failed', e);
+  }
+}
+
+// Refresh whenever the conversation, branch, or selected responder changes.
+watch(
+  () => [currentConversation.value?.id, currentBranchId.value, selectedResponder.value],
+  () => { void refreshContextPreview(messageInput.value); }
+);
+
+// Refresh after a streaming turn completes (new message in window).
+watch(() => isStreaming.value, (now, prev) => {
+  if (prev && !now) void refreshContextPreview(messageInput.value);
+});
+
+// Debounced refresh as the draft changes, so the warning updates while typing.
+watch(() => messageInput.value, (draft) => {
+  if (contextPreviewDebounce !== null) window.clearTimeout(contextPreviewDebounce);
+  contextPreviewDebounce = window.setTimeout(() => { void refreshContextPreview(draft); }, 400);
+});
+
+// Group index containing the first in-window message — divider renders above it.
+const firstInWindowGroupIndex = computed(() => {
+  const id = contextPreview.value?.current.firstInWindowMessageId;
+  if (!id) return -1;
+  const groups = groupedMessages.value;
+  for (let i = 0; i < groups.length; i++) {
+    if (groups[i].messages.some((m: any) => m.id === id)) return i;
+  }
+  return -1;
+});
+
+const showContextDivider = computed(() =>
+  contextPreview.value?.strategy === 'rolling' &&
+  firstInWindowGroupIndex.value > 0
+);
+
+const contextRollWarning = computed(() => {
+  const p = contextPreview.value?.prospective;
+  if (!p || !p.wouldRotate) return null;
+  const n = p.droppedCount;
+  // Phase 2 hook: if compaction is wired, the verb shifts to "compact".
+  return p.wouldTriggerCompaction
+    ? `Context rolls this turn — compacts ${n} earlier message${n === 1 ? '' : 's'}.`
+    : `Context rolls this turn — drops ${n} earlier message${n === 1 ? '' : 's'} from context.`;
+});
+
 // Thinking/reasoning toggle
 const thinkingEnabled = computed(() => {
   return currentConversation.value?.settings?.thinking?.enabled || false;
@@ -1140,10 +1985,34 @@ const thinkingBudgetTokens = computed(() => {
 });
 
 // Check if current model supports thinking (from model config)
+// For standard conversations: check the conversation's model
+// For group chat (prefill/messages): check the selected responder's model
 const modelSupportsThinking = computed(() => {
-  const modelId = currentConversation.value?.model || '';
-  const model = store.state.models.find(m => m.id === modelId);
-  return model?.supportsThinking || false;
+  const format = currentConversation.value?.format;
+  
+  // Treat undefined format as standard (legacy/migrated conversations)
+  if (format === 'standard' || !format) {
+    // Standard format - use conversation model
+    const modelId = currentConversation.value?.model || '';
+    const model = store.state.models.find(m => m.id === modelId);
+    return model?.supportsThinking || false;
+  } else {
+    // Group chat (prefill/messages) - check selected responder's model
+    if (selectedResponder.value) {
+      const responder = participants.value.find(p => p.id === selectedResponder.value);
+      if (responder?.model) {
+        const model = store.state.models.find(m => m.id === responder.model);
+        return model?.supportsThinking || false;
+      }
+    }
+    // No responder selected - check if ANY assistant participant has a thinking-capable model
+    const anyAssistantSupportsThinking = participants.value.some(p => {
+      if (p.type !== 'assistant' || !p.model) return false;
+      const model = store.state.models.find(m => m.id === p.model);
+      return model?.supportsThinking || false;
+    });
+    return anyAssistantSupportsThinking;
+  }
 });
 
 async function toggleThinking() {
@@ -1158,6 +2027,30 @@ async function toggleThinking() {
   };
   
   await updateConversationSettings({ settings: newSettings });
+}
+
+// Detached branch mode - for independent branch navigation in multi-user chats
+const isDetachedFromMainBranch = computed(() => store.state.isDetachedFromMainBranch);
+
+const isCollaborativeConversation = computed(() => {
+  // Show detached toggle for multi-user conversations:
+  // 1. Multiple users currently in room (real-time collaboration)
+  // 2. Conversation has been shared with me (I'm a recipient)
+  // 3. I've shared this conversation with others via public link
+  // 4. This conversation has collaborators (user-to-user sharing)
+  const conversationId = currentConversation.value?.id;
+  if (!conversationId) return false;
+  
+  const multipleUsers = roomUsers.value.length > 1;
+  const sharedWithMe = sharedConversations.value.some(s => s.conversationId === conversationId);
+  const iSharedPublic = myCreatedShares.value.some(s => s.conversationId === conversationId);
+  const hasCollaborators = currentConversationCollaborators.value.length > 0;
+  
+  return multipleUsers || sharedWithMe || iSharedPublic || hasCollaborators;
+});
+
+function toggleDetachedMode() {
+  store.setDetachedMode(!store.state.isDetachedFromMainBranch);
 }
 
 // Get bookmarks in the order they appear in the active conversation path
@@ -1180,6 +2073,106 @@ const bookmarksInActivePath = computed(() => {
 
   return result;
 });
+
+// Get all bookmarks with message content previews for the bookmark browser
+const allBookmarksWithPreviews = computed(() => {
+  return bookmarks.value.map(bookmark => {
+    // Find the message and branch
+    const message = allMessages.value.find(m => m.id === bookmark.messageId);
+    const branch = message?.branches.find(b => b.id === bookmark.branchId);
+    
+    // Generate preview from message content (longer preview to fill wider dropdowns)
+    const content = branch?.content || '';
+    const preview = content.slice(0, 250) + (content.length > 250 ? '...' : '');
+    
+    // Get participant info for color coding
+    let participantName = branch?.role === 'user' ? 'User' : 'Assistant';
+    let participantColor = branch?.role === 'user' ? '#bb86fc' : getModelColor(branch?.model);
+    let modelName: string | null = null;
+    
+    if (branch?.participantId) {
+      const participant = participants.value.find(p => p.id === branch.participantId);
+      if (participant) {
+        participantName = participant.name || (participant.type === 'user' ? '(continue)' : '(continue)');
+        if (participant.type === 'assistant') {
+          participantColor = getModelColor(participant.model || branch.model);
+        }
+      }
+    }
+    
+    // Get model display name for assistant messages
+    if (branch?.role === 'assistant' && branch.model) {
+      const modelObj = store.state.models?.find((m: any) => m.id === branch.model);
+      if (modelObj?.displayName) {
+        modelName = modelObj.displayName;
+      } else if (modelObj?.providerModelId) {
+        modelName = modelObj.providerModelId;
+      } else {
+        // Fallback to shortened model ID
+        modelName = branch.model.split('/').pop() || branch.model;
+      }
+    }
+    
+    return {
+      ...bookmark,
+      preview,
+      participantName,
+      participantColor,
+      modelName,
+      role: branch?.role || 'user'
+    };
+  });
+});
+
+// Check if a bookmark is in the current active path
+function isBookmarkInActivePath(bookmark: Bookmark): boolean {
+  return bookmarksInActivePath.value.some(
+    b => b.messageId === bookmark.messageId && b.branchId === bookmark.branchId
+  );
+}
+
+// Track width of bookmark bar for dropdown (reactive to resize)
+const bookmarkDropdownWidth = ref(500);
+let bookmarkBarResizeObserver: ResizeObserver | null = null;
+
+function updateBookmarkDropdownWidth() {
+  if (bookmarkBarRef.value) {
+    bookmarkDropdownWidth.value = bookmarkBarRef.value.offsetWidth;
+  }
+}
+
+// Set up resize observer when bookmark bar is available
+watch(bookmarkBarRef, (newRef) => {
+  // Clean up old observer
+  if (bookmarkBarResizeObserver) {
+    bookmarkBarResizeObserver.disconnect();
+    bookmarkBarResizeObserver = null;
+  }
+  
+  if (newRef) {
+    // Initial measurement
+    updateBookmarkDropdownWidth();
+    
+    // Set up observer for future changes
+    bookmarkBarResizeObserver = new ResizeObserver(() => {
+      updateBookmarkDropdownWidth();
+    });
+    bookmarkBarResizeObserver.observe(newRef);
+  }
+}, { immediate: true });
+
+// Clean up observer on unmount
+onBeforeUnmount(() => {
+  if (bookmarkBarResizeObserver) {
+    bookmarkBarResizeObserver.disconnect();
+  }
+});
+
+// Navigate to a bookmark (switches branches if needed and scrolls to message)
+async function navigateToBookmark(messageId: string, branchId: string) {
+  // Use navigateToTreeBranch which properly switches all ancestor branches
+  await navigateToTreeBranch(messageId, branchId);
+}
 
 const selectedResponderName = computed(() => {
   const responder = assistantParticipants.value.find(p => p.id === selectedResponder.value);
@@ -1357,6 +2350,32 @@ watch(conversations, (newConversations) => {
 
 // Load initial data
 onMounted(async () => {
+  // Set up console log interceptor for debugging stuck generations
+  if (typeof window !== 'undefined') {
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    
+    const captureLog = (level: string, args: any[]) => {
+      const timestamp = new Date().toISOString();
+      const message = args.map(a => {
+        try {
+          return typeof a === 'object' ? JSON.stringify(a) : String(a);
+        } catch {
+          return '[unserializable]';
+        }
+      }).join(' ');
+      consoleLogs.push(`[${timestamp}] [${level}] ${message}`);
+      if (consoleLogs.length > MAX_CONSOLE_LOGS) {
+        consoleLogs.shift();
+      }
+    };
+    
+    console.log = (...args) => { captureLog('LOG', args); originalLog.apply(console, args); };
+    console.warn = (...args) => { captureLog('WARN', args); originalWarn.apply(console, args); };
+    console.error = (...args) => { captureLog('ERROR', args); originalError.apply(console, args); };
+  }
+  
   if (typeof window !== 'undefined') {
     updateMobileState();
     window.addEventListener('resize', updateMobileState);
@@ -1370,6 +2389,7 @@ onMounted(async () => {
   await store.loadSystemConfig();
   await store.loadConversations();
   await loadSharedConversations();
+  await loadMyCreatedShares();
   await loadPersonas();
 
   // Set local systemConfig from store
@@ -1388,9 +2408,11 @@ onMounted(async () => {
           const lastBranch = data.message.branches[data.message.branches.length - 1];
           if (lastBranch.role === 'assistant') {
             streamingMessageId.value = data.message.id;
+            streamingBranchId.value = lastBranch.id; // Track which branch is streaming
             isStreaming.value = true;
             autoScrollEnabled.value = true; // Re-enable auto-scroll for new messages
             streamingError.value = null; // Clear any previous errors
+            startStuckDetection(); // Start tracking for stuck generation
           }
           
           // Update the conversation's updatedAt timestamp to move it to the top
@@ -1410,29 +2432,63 @@ onMounted(async () => {
         if (data.message && data.message.branches?.length > 0) {
           const activeBranch = data.message.branches.find((b: any) => b.id === data.message.activeBranchId);
           // If the active branch is an assistant with empty/minimal content, streaming is starting
-          if (activeBranch && activeBranch.role === 'assistant' && (!activeBranch.content || activeBranch.content.length < 10)) {
+          // BUT: Don't re-enter streaming mode if:
+          // 1. We're already streaming for this exact message, OR
+          // 2. This branch ID was recently streamed (completed within last 30 seconds)
+          // This prevents race conditions with fast completions and DEBUG CAPTURE updates
+          const alreadyStreamingThisMessage = isStreaming.value && streamingMessageId.value === data.message.id;
+          const recentlyCompletedBranch = lastCompletedBranchId.value === data.message.activeBranchId && 
+            lastCompletedTime.value && (Date.now() - lastCompletedTime.value < 30000);
+          
+          if (!alreadyStreamingThisMessage && !recentlyCompletedBranch && 
+              activeBranch && activeBranch.role === 'assistant' && 
+              (!activeBranch.content || activeBranch.content.length < 10)) {
             streamingMessageId.value = data.message.id;
+            streamingBranchId.value = data.message.activeBranchId;
             isStreaming.value = true;
             autoScrollEnabled.value = true;
             streamingError.value = null;
+            startStuckDetection(); // Start tracking for stuck generation
             console.log('[WebSocket] Regenerate detected - starting streaming for message:', data.message.id.slice(0, 8));
           }
         }
       });
       
       store.state.wsService.on('stream', (data: any) => {
-        // Streaming content update
-        if (data.messageId === streamingMessageId.value) {
-          // Check if streaming is complete or was aborted
+        // Streaming content update - track which branch is being streamed
+        // This helps us know whether to auto-scroll (only if visible branch is streaming)
+        if (data.messageId && data.branchId) {
+          // Check if this is the active (visible) branch of the message
+          const message = store.state.allMessages.find(m => m.id === data.messageId);
+          const isActiveBranch = message && message.activeBranchId === data.branchId;
+          
+          // Track token arrival for stuck detection (only for tracked message)
+          if (data.messageId === streamingMessageId.value && (data.content || data.contentBlocks)) {
+            onTokenReceived();
+          }
+          
           if (data.isComplete || data.aborted) {
-            isStreaming.value = false;
-            streamingMessageId.value = null;
+            // This branch finished streaming
+            // Track this completed branch to prevent re-triggering from DEBUG CAPTURE updates
+            if (data.branchId) {
+              lastCompletedBranchId.value = data.branchId;
+              lastCompletedTime.value = Date.now();
+            }
+            // Clear tracking if this was the tracked branch (whether active or not)
+            if (data.branchId === streamingBranchId.value) {
+              streamingBranchId.value = null;
+              isStreaming.value = false;
+              streamingMessageId.value = null;
+              clearStuckDetection();
+            }
             if (data.aborted) {
               console.log('Generation was aborted');
             }
           } else {
-            // Still streaming
-            if (!isStreaming.value) {
+            // Still streaming - only track if this is the active (visible) branch
+            if (isActiveBranch) {
+              streamingMessageId.value = data.messageId;
+              streamingBranchId.value = data.branchId;
               isStreaming.value = true;
             }
           }
@@ -1445,6 +2501,8 @@ onMounted(async () => {
         if (data.conversationId === currentConversation.value?.id) {
           isStreaming.value = false;
           streamingMessageId.value = null;
+          streamingBranchId.value = null;
+          clearStuckDetection();
         }
       });
       
@@ -1566,6 +2624,13 @@ onMounted(async () => {
         }
       });
       
+      store.state.wsService.on('content_blocked', (data: any) => {
+        // Content was blocked by moderation - show informative dialog
+        console.warn('Content blocked by moderation:', data);
+        contentBlockedData.value = data;
+        contentBlockedDialog.value = true;
+      });
+      
       // Multi-user room events
       store.state.wsService.on('room_joined', (data: any) => {
         console.log('[Room] Joined room:', data.conversationId);
@@ -1618,6 +2683,7 @@ onMounted(async () => {
             console.log('[Room] Clearing streaming state from ai_finished event');
             isStreaming.value = false;
             streamingMessageId.value = null;
+            streamingBranchId.value = null;
           }
         }
       });
@@ -1639,30 +2705,86 @@ onMounted(async () => {
     welcomeDialog.value = true;
   }
   
-  // Load conversation from route
-  if (route.params.id) {
-    await store.loadConversation(route.params.id as string);
-    await loadParticipants();
-    await loadBookmarks();
-    
+  // Load conversation from route (handles both /conversation/:id and /conversation/:conversationId/message/:messageId)
+  const conversationId = (route.params.conversationId || route.params.id) as string | undefined;
+  if (conversationId) {
+    console.log(`[ConversationView] Route has conversation ID: ${conversationId}`);
+    console.log(`[ConversationView] Starting conversation load...`);
+    const loadStart = Date.now();
+    isLoadingConversation.value = true;
+
+    try {
+      await store.loadConversation(conversationId);
+      console.log(`[ConversationView] ✓ store.loadConversation completed in ${Date.now() - loadStart}ms`);
+      console.log(`[ConversationView] allMessages.length: ${store.state.allMessages.length}`);
+    } catch (error) {
+      console.error(`[ConversationView] ✗ store.loadConversation failed:`, error);
+    } finally {
+      isLoadingConversation.value = false;
+    }
+
+    try {
+      await loadParticipants();
+      console.log(`[ConversationView] ✓ loadParticipants completed`);
+    } catch (error) {
+      console.error(`[ConversationView] ✗ loadParticipants failed:`, error);
+    }
+
+    try {
+      await loadBookmarks();
+      console.log(`[ConversationView] ✓ loadBookmarks completed`);
+    } catch (error) {
+      console.error(`[ConversationView] ✗ loadBookmarks failed:`, error);
+    }
+
+    try {
+      await loadCurrentConversationCollaborators();
+      console.log(`[ConversationView] ✓ loadCurrentConversationCollaborators completed`);
+    } catch (error) {
+      console.error(`[ConversationView] ✗ loadCurrentConversationCollaborators failed:`, error);
+    }
+
+    console.log(`[ConversationView] Total load time: ${Date.now() - loadStart}ms`);
+
     // Join the room for multi-user support
     if (store.state.wsService) {
-      store.state.wsService.joinRoom(route.params.id as string);
+      console.log(`[ConversationView] Joining WebSocket room: ${conversationId}`);
+      store.state.wsService.joinRoom(conversationId);
+    } else {
+      console.warn(`[ConversationView] ⚠ wsService not available for room join`);
     }
-    
-    // Scroll to bottom after messages load
+
+    // Ensure DOM is updated before scrolling
     await nextTick();
-    // Add small delay for long conversations
-    setTimeout(() => {
-      scrollToBottom();
-    }, 100);
+
+    // Check if this is a deep link to a specific message
+    const messageId = route.params.messageId as string | undefined;
+    const branchId = route.query.branch as string | undefined;
+
+    if (messageId) {
+      // Deep link - navigate to specific message
+      setTimeout(async () => {
+        await handleEventNavigate(messageId, branchId);
+        // Clean up the URL to the simple form
+        router.replace(`/conversation/${conversationId}`);
+      }, 100);
+    } else {
+      // Normal load - scroll to bottom
+      setTimeout(() => {
+        scrollToBottom();
+      }, 100);
+    }
 
     if (isMobile.value) {
       mobilePanel.value = 'conversation';
       drawer.value = false;
     }
+  } else {
+    console.log(`[ConversationView] No conversation ID in route`);
   }
-
+  
+  // Mark initialization as complete so route watcher can take over
+  isInitialized.value = true;
 });
 
 onBeforeUnmount(() => {
@@ -1679,8 +2801,20 @@ onBeforeUnmount(() => {
 // Store drafts per conversation
 const conversationDrafts = ref<Map<string, string>>(new Map());
 
+// Track if initial setup is complete
+const isInitialized = ref(false);
+
+// Get conversation ID from either route format
+function getConversationIdFromRoute(): string | undefined {
+  // Handle both /conversation/:id and /conversation/:conversationId/message/:messageId
+  return (route.params.conversationId || route.params.id) as string | undefined;
+}
+
 // Watch route changes
-watch(() => route.params.id, async (newId, oldId) => {
+watch(() => getConversationIdFromRoute(), async (newId, oldId) => {
+  // Skip if not yet initialized (will be handled by onMounted -> loadInitialConversation)
+  if (!isInitialized.value) return;
+  
   if (isMobile.value) {
     mobilePanel.value = newId ? 'conversation' : 'sidebar';
   }
@@ -1701,9 +2835,14 @@ watch(() => route.params.id, async (newId, oldId) => {
   // Reset streaming state when switching conversations
   isStreaming.value = false;
   streamingMessageId.value = null;
+  streamingBranchId.value = null;
   streamingError.value = null;
   
   if (newId) {
+    console.log(`[ConversationView:watch] Route changed to: ${newId}`);
+    const loadStart = Date.now();
+    isLoadingConversation.value = true;
+    
     // Restore draft for this conversation or clear input
     messageInput.value = conversationDrafts.value.get(newId as string) || '';
     
@@ -1712,9 +2851,20 @@ watch(() => route.params.id, async (newId, oldId) => {
       cancelBranchSelection();
     }
 
-    await store.loadConversation(newId as string);
+    try {
+      await store.loadConversation(newId as string);
+      console.log(`[ConversationView:watch] ✓ Conversation loaded in ${Date.now() - loadStart}ms, messages: ${store.state.allMessages.length}`);
+    } catch (error) {
+      console.error(`[ConversationView:watch] ✗ Failed to load conversation:`, error);
+    } finally {
+      isLoadingConversation.value = false;
+    }
+    
     await loadParticipants();
     await loadBookmarks();
+    await loadCurrentConversationCollaborators();
+    
+    console.log(`[ConversationView:watch] Total load time: ${Date.now() - loadStart}ms`);
     
     // Join the room for multi-user support
     if (store.state.wsService) {
@@ -1723,20 +2873,71 @@ watch(() => route.params.id, async (newId, oldId) => {
     
     // Ensure DOM is updated before scrolling
     await nextTick();
-    // Add small delay for long conversations
-    setTimeout(() => {
-      scrollToBottom();
-    }, 100);
+
+    // Check if this is a deep link to a specific message
+    const messageId = route.params.messageId as string | undefined;
+    const branchId = route.query.branch as string | undefined;
+
+    if (messageId) {
+      // Deep link - navigate to specific message
+      setTimeout(async () => {
+        await handleEventNavigate(messageId, branchId);
+        // Clean up the URL to the simple form
+        router.replace(`/conversation/${newId}`);
+      }, 100);
+    } else {
+      // Normal load - scroll to bottom
+      setTimeout(() => {
+        scrollToBottom();
+      }, 100);
+    }
   } else {
     // Navigating away from a conversation - clear input
     messageInput.value = '';
   }
 });
 
+// Save UI state when speaking as or responder changes
+watch(selectedParticipant, (newValue) => {
+  if (newValue && !isLoadingUIState.value) {
+    saveUserUIState({ speakingAs: newValue });
+  }
+});
+
+watch(selectedResponder, (newValue) => {
+  if (newValue && !isLoadingUIState.value) {
+    saveUserUIState({ selectedResponder: newValue });
+  }
+});
+
+// Save detached mode changes
+watch(() => store.state.isDetachedFromMainBranch, (newValue) => {
+  if (!isLoadingUIState.value) {
+    saveUserUIState({ isDetached: newValue });
+  }
+});
+
 // Watch for new messages to scroll
 watch(messages, () => {
-  // Don't auto-scroll if we're switching branches via the navigation arrows
-  if (autoScrollEnabled.value && !isSwitchingBranch.value) {
+  // Don't auto-scroll if:
+  // 1. Auto-scroll is disabled (user scrolled up)
+  // 2. User is actively scrolling (prevents fighting with user input)
+  // 3. We're switching branches via the navigation arrows
+  // 4. We're streaming but the streaming branch is not the visible one
+  
+  // Check if the currently streaming branch is visible
+  const isStreamingVisibleBranch = !isStreaming.value || (
+    streamingMessageId.value && 
+    streamingBranchId.value &&
+    messages.value.some(m => m.id === streamingMessageId.value && m.activeBranchId === streamingBranchId.value)
+  );
+  
+  const shouldScroll = autoScrollEnabled.value && 
+                       !userScrolledRecently.value &&
+                       !isSwitchingBranch.value &&
+                       isStreamingVisibleBranch;
+  
+  if (shouldScroll) {
     nextTick(() => {
       scrollToBottom(true); // Smooth scroll for new messages
     });
@@ -1745,6 +2946,7 @@ watch(messages, () => {
 
 // Set up scroll sync for breadcrumb navigation and auto-scroll detection
 let scrollTimeout: number;
+let userScrollCooldown: number;
 watch(messagesContainer, (container) => {
   if (container) {
     // Vuetify components expose their DOM element via $el
@@ -1752,15 +2954,25 @@ watch(messagesContainer, (container) => {
 
     if (element && element.addEventListener) {
       const handleScroll = () => {
-        // Check if user has scrolled away from bottom - disable auto-scroll if so
-        if (isStreaming.value) {
+        // Ignore programmatic scrolls for user interaction tracking
+        // But still allow them to sync breadcrumbs
+        if (!isProgrammaticScroll.value) {
+          // Mark that user scrolled recently - prevents auto-scroll from fighting
+          userScrolledRecently.value = true;
+          clearTimeout(userScrollCooldown);
+          userScrollCooldown = window.setTimeout(() => {
+            userScrolledRecently.value = false;
+          }, 300); // Wait 300ms after last scroll before allowing auto-scroll
+          
+          // Check scroll position and update autoScrollEnabled
+          // This allows user to scroll up to disable auto-scroll at any time
           const scrollBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
-          // If even 1px from bottom, user has scrolled up - disable auto-scroll
-          if (scrollBottom > 1) {
+          // If user has scrolled up more than a small threshold, disable auto-scroll
+          if (scrollBottom > 50) {
             autoScrollEnabled.value = false;
           }
-          // If user scrolls back to absolute bottom, re-enable
-          else if (scrollBottom <= 1) {
+          // If user scrolls back near the bottom, re-enable (only for user scrolls)
+          else if (scrollBottom <= 10) {
             autoScrollEnabled.value = true;
           }
         }
@@ -1830,34 +3042,47 @@ watch(messages, () => {
 }, { deep: true });
 
 function scrollToBottom(smooth: boolean = false) {
-  // For long conversations, we need multiple frames to ensure full render
-  const attemptScroll = (attempts: number = 0) => {
+  // Mark this as a programmatic scroll so the scroll handler doesn't re-enable autoScroll
+  isProgrammaticScroll.value = true;
+  
+  // Long conversations render in bursts (markdown, code highlight, images,
+  // late-loading media). The old logic stopped re-scrolling the first time
+  // height didn't grow within one 50ms window — a normal render *lull* —
+  // which left the view stranded near the top. Instead keep re-pinning to
+  // the bottom each tick and only conclude once the height has been stable
+  // for several consecutive ticks (or a bounded number of attempts).
+  const MAX_ATTEMPTS = 20;       // ~1s ceiling for very heavy conversations
+  const STABLE_TICKS_REQUIRED = 3; // ~150ms of quiet before we call it done
+  const finish = () => {
+    setTimeout(() => { isProgrammaticScroll.value = false; }, 100);
+  };
+  const attemptScroll = (attempts: number = 0, stableTicks: number = 0) => {
     requestAnimationFrame(() => {
-      if (messagesContainer.value) {
-        const container = messagesContainer.value;
-        // Vuetify components expose their DOM element via $el
-        const element = (container as any).$el || container;
-        
-        if (element && element.scrollTo) {
-          const previousHeight = element.scrollHeight;
-          
-          element.scrollTo({
-            top: element.scrollHeight,
-            behavior: smooth ? 'smooth' : 'instant'
-          });
-          
-          // Check if content is still loading (scroll height is changing)
-          if (attempts < 10) { // Increased attempts for very long conversations
-            setTimeout(() => {
-              const el = (messagesContainer.value as any)?.$el || messagesContainer.value;
-              if (el && el.scrollHeight > previousHeight) {
-                // Content grew, scroll again
-                attemptScroll(attempts + 1);
-              }
-            }, 50); // Reduced delay for more responsive scrolling
-          }
+      const container = messagesContainer.value;
+      if (!container) { finish(); return; }
+      // Vuetify components expose their DOM element via $el
+      const element = (container as any).$el || container;
+      if (!element || !element.scrollTo) { finish(); return; }
+
+      const previousHeight = element.scrollHeight;
+      // Re-pin every tick so any late growth still lands at the bottom.
+      element.scrollTo({
+        top: element.scrollHeight,
+        behavior: smooth ? 'smooth' : 'instant'
+      });
+
+      if (attempts >= MAX_ATTEMPTS) { finish(); return; }
+
+      setTimeout(() => {
+        const el = (messagesContainer.value as any)?.$el || messagesContainer.value;
+        const grew = !!el && el.scrollHeight > previousHeight;
+        const nextStable = grew ? 0 : stableTicks + 1;
+        if (nextStable >= STABLE_TICKS_REQUIRED) {
+          finish();
+        } else {
+          attemptScroll(attempts + 1, nextStable);
         }
-      }
+      }, 50);
     });
   };
   
@@ -1885,10 +3110,13 @@ async function createNewConversation() {
                       store.state.models[0]?.id || 
                       'claude-3.6-sonnet';
   const conversation = await store.createConversation(defaultModel);
+  // Provisional until the user actually confirms settings; dismissing the
+  // auto-opened dialog without saving will discard it.
+  provisionalNewConversationId.value = conversation.id;
   router.push(`/conversation/${conversation.id}`);
   // Load participants for the new conversation
   await loadParticipants();
-  
+
   if (isMobile.value) {
     mobilePanel.value = 'conversation';
   }
@@ -1917,9 +3145,9 @@ async function sendMessage() {
   hiddenFromAi.value = false; // Reset hiddenFromAi for next message (sampling stays)
   
   // Only set streaming state if message will trigger AI generation
-  // Hidden messages and messages without responder don't trigger AI
+  // Hidden messages, no-response mode, and messages without responder don't trigger AI
   const willTriggerAi = !messageHiddenFromAi && (
-    currentConversation.value?.format === 'standard' || selectedResponder.value
+    (currentConversation.value?.format === 'standard' && !noResponseMode.value) || selectedResponder.value
   );
   
   if (willTriggerAi && !isMultiuserConversation.value) {
@@ -1942,7 +3170,8 @@ async function sendMessage() {
       const defaultAssistant = participants.value.find(p => p.type === 'assistant' && p.name === 'Assistant');
       
       participantId = defaultUser?.id;
-      responderId = defaultAssistant?.id;
+      // Only set responderId if not in no-response mode
+      responderId = noResponseMode.value ? undefined : defaultAssistant?.id;
     } else {
       // For other formats, use selected participants
       participantId = selectedParticipant.value || undefined;
@@ -2092,6 +3321,7 @@ async function regenerateMessage(messageId: string, branchId: string) {
   console.log('parentBranchId:', parentBranchId?.slice(0, 8));
   console.log('visible messages count:', visibleMessages.length);
   console.log('message index in visible:', messageIndex);
+  console.log('samplingBranches:', samplingBranches.value);
   
   // Set streaming state before sending request
   streamingMessageId.value = messageId;
@@ -2099,7 +3329,7 @@ async function regenerateMessage(messageId: string, branchId: string) {
   streamingError.value = null;
   autoScrollEnabled.value = true;
   
-  await store.regenerateMessage(messageId, branchId, parentBranchId);
+  await store.regenerateMessage(messageId, branchId, parentBranchId, samplingBranches.value);
 }
 
 function abortGeneration() {
@@ -2108,24 +3338,139 @@ function abortGeneration() {
   // Note: isStreaming will be reset when we receive the aborted stream event
 }
 
-async function editMessage(messageId: string, branchId: string, content: string) {
+// Stuck generation detection
+function startStuckDetection() {
+  streamingStartTime.value = Date.now();
+  firstTokenReceived.value = false;
+  showStuckButton.value = false;
+  
+  // Clear any existing timer
+  if (stuckCheckTimer) {
+    clearTimeout(stuckCheckTimer);
+  }
+  
+  // Set timer to check for stuck state after threshold (model-dependent)
+  const thresholdMs = getStuckThresholdMs();
+  stuckCheckTimer = setTimeout(() => {
+    if (isStreaming.value && !firstTokenReceived.value) {
+      console.warn('[Stuck Detection] Generation appears stuck - no tokens received after', thresholdMs / 1000, 'seconds');
+      showStuckButton.value = true;
+    }
+  }, thresholdMs);
+}
+
+function onTokenReceived() {
+  // Track when we last received content (for "content but no completion" detection)
+  lastContentReceivedTime.value = Date.now();
+  
+  // Reset the "content stuck" timer - we're still receiving content
+  if (contentStuckCheckTimer) {
+    clearTimeout(contentStuckCheckTimer);
+  }
+  // Start a new timer - if no completion arrives within CONTENT_STUCK_TIMEOUT_MS, show stuck button
+  contentStuckCheckTimer = setTimeout(() => {
+    if (isStreaming.value && firstTokenReceived.value) {
+      console.warn('[Stuck Detection] Content received but no completion after', CONTENT_STUCK_TIMEOUT_MS / 1000, 'seconds');
+      showStuckButton.value = true;
+    }
+  }, CONTENT_STUCK_TIMEOUT_MS);
+  
+  if (!firstTokenReceived.value) {
+    firstTokenReceived.value = true;
+    showStuckButton.value = false;
+    if (stuckCheckTimer) {
+      clearTimeout(stuckCheckTimer);
+      stuckCheckTimer = null;
+    }
+  }
+}
+
+function clearStuckDetection() {
+  streamingStartTime.value = null;
+  firstTokenReceived.value = false;
+  lastContentReceivedTime.value = null;
+  showStuckButton.value = false;
+  if (stuckCheckTimer) {
+    clearTimeout(stuckCheckTimer);
+    stuckCheckTimer = null;
+  }
+  if (contentStuckCheckTimer) {
+    clearTimeout(contentStuckCheckTimer);
+    contentStuckCheckTimer = null;
+  }
+}
+
+async function submitStuckAnalytics() {
+  stuckAnalyticsSubmitting.value = true;
+  
+  try {
+    const analyticsData = {
+      timestamp: new Date().toISOString(),
+      streamingStartTime: streamingStartTime.value ? new Date(streamingStartTime.value).toISOString() : null,
+      elapsedMs: streamingStartTime.value ? Date.now() - streamingStartTime.value : null,
+      lastContentReceivedTime: lastContentReceivedTime.value ? new Date(lastContentReceivedTime.value).toISOString() : null,
+      timeSinceLastContent: lastContentReceivedTime.value ? Date.now() - lastContentReceivedTime.value : null,
+      conversationId: currentConversation.value?.id,
+      streamingMessageId: streamingMessageId.value,
+      streamingBranchId: streamingBranchId.value,
+      firstTokenReceived: firstTokenReceived.value,
+      wsConnected: store.state.wsService?.isConnected,
+      userAgent: navigator.userAgent,
+      consoleLogs: consoleLogs.slice(-100), // Last 100 logs
+      currentUrl: window.location.href,
+    };
+    
+    // Send to backend
+    await api.post('/analytics/stuck-generation', analyticsData);
+    console.log('[Stuck Detection] Analytics submitted successfully');
+  } catch (error) {
+    console.error('[Stuck Detection] Failed to submit analytics:', error);
+  } finally {
+    stuckAnalyticsSubmitting.value = false;
+    stuckDialog.value = false;
+    // Reload the page
+    window.location.reload();
+  }
+}
+
+function dismissStuckDialog() {
+  stuckDialog.value = false;
+  showStuckButton.value = false;
+}
+
+async function editMessage(messageId: string, branchId: string, content: string, attachments?: WsAttachment[]) {
   // Pass the currently selected responder for multi-participant mode
   let responderId: string | undefined;
   
   if (currentConversation.value?.format === 'standard') {
-    // For standard format, use default assistant
-    const defaultAssistant = participants.value.find(p => p.type === 'assistant' && p.name === 'Assistant');
-    responderId = defaultAssistant?.id;
+    // For standard format, use default assistant (unless in no-response mode)
+    if (!noResponseMode.value) {
+      const defaultAssistant = participants.value.find(p => p.type === 'assistant' && p.name === 'Assistant');
+      responderId = defaultAssistant?.id;
+    }
   } else {
     // For other formats, use selected responder
     responderId = selectedResponder.value || undefined;
   }
   
-  await store.editMessage(messageId, branchId, content, responderId);
+  await store.editMessage(messageId, branchId, content, responderId, false, samplingBranches.value, attachments);
+}
+
+async function editMessageOnly(messageId: string, branchId: string, content: string, attachments?: WsAttachment[]) {
+  // Edit and branch without triggering AI regeneration
+  await store.editMessage(messageId, branchId, content, undefined, true, undefined, attachments);
 }
 
 function switchBranch(messageId: string, branchId: string) {
   isSwitchingBranch.value = true;
+  
+  // Don't clear streaming state here - let stream completion events handle that
+  // The scroll logic will check if the streaming branch is visible
+  // Also disable auto-scroll when switching branches during streaming
+  if (isStreaming.value) {
+    autoScrollEnabled.value = false;
+  }
+  
   store.switchBranch(messageId, branchId);
   // Reset the flag after a short delay to allow the watch to process
   setTimeout(() => {
@@ -2175,13 +3520,16 @@ async function navigateToTreeBranch(messageId: string, branchId: string) {
   // Set flag to prevent auto-scrolling during branch switches
   isSwitchingBranch.value = true;
   
-  // Switch branches along the path
-  for (const { messageId: msgId, branchId: brId } of pathToRoot) {
+  // Collect all branches that need switching
+  const branchesToSwitch = pathToRoot.filter(({ messageId: msgId, branchId: brId }) => {
     const message = allMessages.value.find(m => m.id === msgId);
-    if (message && message.activeBranchId !== brId) {
-      console.log('Switching branch:', msgId, brId);
-      store.switchBranch(msgId, brId);
-    }
+    return message && message.activeBranchId !== brId;
+  });
+  
+  // Use batch switch for much faster navigation
+  if (branchesToSwitch.length > 0) {
+    console.log(`Batch switching ${branchesToSwitch.length} branches`);
+    store.switchBranchesBatch(branchesToSwitch);
   }
   
   // Reset the flag after branches are switched
@@ -2250,6 +3598,68 @@ async function exportConversation(id: string) {
   }
 }
 
+async function exportConversationMarkdown(id: string) {
+  try {
+    // Reuse the existing export endpoint (messages already tree-ordered by the
+    // backend), then resolve the visible active-branch path with the shared
+    // store helper and serialize to markdown. No conversation needs to be
+    // loaded in the store for this to work.
+    const response = await fetch(`/api/conversations/${id}/export`, {
+      headers: {
+        'Authorization': `Bearer ${localStorage.getItem('token')}`
+      }
+    });
+    if (!response.ok) {
+      let detail = '';
+      try {
+        detail = (await response.json())?.error || '';
+      } catch {
+        // response body was not JSON; leave detail empty
+      }
+      errorSnackbarMessage.value = 'Markdown export failed';
+      errorSnackbarDetails.value = detail || `Server returned ${response.status}`;
+      errorSnackbar.value = true;
+      return;
+    }
+    const data = await response.json();
+
+    const visibleMessages = computeVisibleMessages(data.messages || []);
+    const markdown = serializeConversationToMarkdown({
+      conversation: data.conversation,
+      participants: data.participants || [],
+      messages: visibleMessages,
+    });
+
+    const safeTitle = (data.conversation?.title || `conversation-${id}`)
+      .replace(/[^\w\-. ]+/g, '_')
+      .trim()
+      .slice(0, 80) || `conversation-${id}`;
+
+    const blob = new Blob([markdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeTitle}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    console.error('Markdown export failed:', error);
+    errorSnackbarMessage.value = 'Markdown export failed';
+    errorSnackbarDetails.value = error instanceof Error ? error.message : String(error);
+    errorSnackbar.value = true;
+  }
+}
+
+async function connectToResearchCommons() {
+  try {
+    const response = await api.post('/link/generate');
+    const { url } = response.data;
+    window.open(url, '_blank');
+  } catch (error) {
+    console.error('Failed to generate RC link:', error);
+  }
+}
+
 function handleConversationClick(_conversationId: string) {
   if (isMobile.value) {
     mobilePanel.value = 'conversation';
@@ -2265,7 +3675,7 @@ function triggerFileInput(event: Event) {
   // Create a new file input and click it immediately
   const input = document.createElement('input');
   input.type = 'file';
-  input.accept = '.txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.java,.cpp,.c,.h,.hpp,.jpg,.jpeg,.png,.gif,.webp,.svg';
+  input.accept = '.txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.java,.cpp,.c,.h,.hpp,.jpg,.jpeg,.png,.gif,.webp,.svg,.pdf,application/pdf,.mp3,.wav,.flac,.ogg,.m4a,.aac,.mp4,.mov,.avi,.mkv,.webm';
   input.multiple = true;
   input.style.display = 'none';
   
@@ -2291,6 +3701,23 @@ function handleTextareaFocus() {
       }
     }, 300);
   }
+}
+
+function handleMessageEnterKey(event: KeyboardEvent) {
+  if (event.isComposing) return;
+
+  if (event.metaKey || event.ctrlKey) {
+    event.preventDefault();
+    sendMessage();
+    return;
+  }
+
+  if (isMobile.value || event.shiftKey) {
+    return;
+  }
+
+  event.preventDefault();
+  sendMessage();
 }
 
 // Typing notification state
@@ -2596,6 +4023,32 @@ async function archiveConversation(id: string) {
   }
 }
 
+async function compactConversation(id: string) {
+  if (confirm('This will compact the conversation\'s event log to reduce file size. Debug data will be stripped. Continue?')) {
+    try {
+      const result = await store.compactConversation(id);
+      if (result.success) {
+        const r = result.result;
+        alert(`Compaction complete!\n\nSize: ${r.originalSizeMB} MB → ${r.compactedSizeMB} MB (${r.reductionPercent}% reduction)\nEvents: ${r.originalEventCount} → ${r.compactedEventCount}\n\n${result.message}`);
+      } else {
+        alert('Compaction failed: ' + result.message);
+      }
+    } catch (error: any) {
+      console.error('Compaction error:', error);
+      alert('Compaction failed: ' + (error.response?.data?.error || error.message || 'Unknown error'));
+    }
+  }
+}
+
+function markConversationAsRead(conversation: Conversation) {
+  // Get all branch IDs from this conversation
+  // If it's the current conversation, use allMessages; otherwise we'd need to load it
+  if (currentConversation.value?.id === conversation.id) {
+    const allBranchIds = allMessages.value.flatMap(m => m.branches.map((b: any) => b.id));
+    store.markBranchesAsRead(allBranchIds);
+  }
+}
+
 function openDuplicateDialog(conversation: Conversation) {
   duplicateConversationTarget.value = conversation;
   duplicateDialog.value = true;
@@ -2618,6 +4071,14 @@ async function handleDuplicated(newConversation: Conversation) {
 }
 
 async function updateConversationSettings(updates: Partial<Conversation>) {
+  // The user confirmed settings for the freshly-created conversation, so it
+  // is no longer provisional and must not be discarded on dialog close.
+  if (
+    provisionalNewConversationId.value &&
+    currentConversation.value?.id === provisionalNewConversationId.value
+  ) {
+    provisionalNewConversationId.value = null;
+  }
   if (currentConversation.value) {
     await store.updateConversation(currentConversation.value.id, updates);
     
@@ -2627,6 +4088,64 @@ async function updateConversationSettings(updates: Partial<Conversation>) {
     }
   }
 }
+
+// If the auto-opened settings dialog for a brand-new conversation is closed
+// without saving, the conversation was never actually wanted. Discard it so
+// dismissing/cancelling no longer litters the sidebar with default
+// "New Conversation" entries. (Hard delete does not exist in this
+// event-sourced model; archive is the established cleanup primitive.)
+watch(conversationSettingsDialog, async (isOpen, wasOpen) => {
+  if (!wasOpen || isOpen || !provisionalNewConversationId.value) return;
+
+  const discardId = provisionalNewConversationId.value;
+  provisionalNewConversationId.value = null;
+
+  // Never discard a conversation that already has content.
+  const hasContent =
+    currentConversation.value?.id === discardId && messages.value.length > 0;
+  if (hasContent) return;
+
+  try {
+    await store.archiveConversation(discardId);
+  } catch (e) {
+    console.error('Failed to discard provisional conversation:', e);
+    return;
+  }
+  if (currentConversation.value?.id === discardId || route.params.id === discardId) {
+    router.push('/conversation');
+  }
+});
+
+// Browser back / sidebar nav / any route change away from a provisional
+// conversation should discard it too — the dialog-close watcher above
+// doesn't fire when the route guard tears down the component before the
+// dialog has a chance to close. Without this, hitting back during the
+// auto-opened settings dialog leaves the provisional conversation behind,
+// re-creating the very bug #99 was meant to fix.
+onBeforeRouteLeave((_to, from) => {
+  if (!provisionalNewConversationId.value) return;
+  const discardId = provisionalNewConversationId.value;
+  // Only act if we're navigating away from the provisional conversation itself.
+  if (from.params.id !== discardId) return;
+
+  // Clear the flag first so the dialog-close watcher (if it fires during
+  // teardown) short-circuits and we don't double-archive.
+  provisionalNewConversationId.value = null;
+  conversationSettingsDialog.value = false;
+
+  const hasContent =
+    currentConversation.value?.id === discardId && messages.value.length > 0;
+  if (hasContent) return;
+
+  // Fire-and-forget. The guard must return synchronously — Vue Router 4
+  // awaits any Promise we return, which would stall the user's navigation
+  // (back button, sidebar click) on the archive API call. Greptile #105
+  // caught this: the previous `async` form did exactly that. Catch errors
+  // off the floating promise so they're still logged.
+  void store.archiveConversation(discardId).catch((e) => {
+    console.error('Failed to discard provisional conversation on route leave:', e);
+  });
+});
 
 async function switchToGroupChat() {
   if (!currentConversation.value) return;
@@ -2711,6 +4230,66 @@ async function handlePostHocEditContent(messageId: string, branchId: string, con
     await store.loadConversation(currentConversation.value.id);
   } catch (error) {
     console.error('Failed to create post-hoc edit operation:', error);
+  }
+}
+
+async function handleSplit(messageId: string, branchId: string, splitPosition: number) {
+  if (!currentConversation.value) return;
+  
+  try {
+    const response = await api.post(`/conversations/${currentConversation.value.id}/messages/${messageId}/split`, {
+      branchId,
+      splitPosition
+    });
+    
+    if (response.data.success) {
+      // Reload to get updated messages
+      await store.loadConversation(currentConversation.value.id);
+    }
+  } catch (error) {
+    console.error('Failed to split message:', error);
+  }
+}
+
+function handleFork(messageId: string, branchId: string) {
+  if (!currentConversation.value) return;
+  
+  // Open the fork dialog
+  forkTargetMessageId.value = messageId;
+  forkTargetBranchId.value = branchId;
+  forkMode.value = 'full';
+  forkIncludePrivateBranches.value = false;
+  showForkDialog.value = true;
+}
+
+async function executeFork() {
+  if (!currentConversation.value) return;
+  
+  forkIsLoading.value = true;
+  
+  try {
+    const response = await api.post(`/conversations/${currentConversation.value.id}/fork`, {
+      messageId: forkTargetMessageId.value,
+      branchId: forkTargetBranchId.value,
+      mode: forkMode.value,  // 'full' | 'compressed' | 'truncated'
+      includePrivateBranches: forkIncludePrivateBranches.value
+    });
+    
+    if (response.data.success && response.data.conversation) {
+      showForkDialog.value = false;
+      
+      // Reload conversations list
+      await store.loadConversations();
+      
+      // Navigate to the new conversation
+      router.push(`/conversation/${response.data.conversation.id}`);
+    }
+  } catch (error) {
+    console.error('Failed to fork conversation:', error);
+    errorSnackbarMessage.value = 'Failed to fork conversation';
+    errorSnackbar.value = true;
+  } finally {
+    forkIsLoading.value = false;
   }
 }
 
@@ -2808,8 +4387,77 @@ async function handleBookmarkChanged() {
 function scrollToMessage(messageId: string) {
   const element = document.getElementById(`message-${messageId}`);
   if (element) {
-    element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    
+    // Add a brief highlight effect
+    element.classList.add('highlight-flash');
+    setTimeout(() => {
+      element.classList.remove('highlight-flash');
+    }, 1500);
+  } else {
+    console.warn(`[scrollToMessage] Element not found for message: ${messageId}`);
   }
+}
+
+async function handleEventNavigate(messageId: string, branchId?: string) {
+  console.log(`[handleEventNavigate] messageId: ${messageId}, branchId: ${branchId}`);
+  
+  // Find the message in the store
+  const message = store.state.allMessages.find(m => m.id === messageId);
+  
+  if (!message) {
+    console.warn(`[handleEventNavigate] Message not found in allMessages: ${messageId}`);
+    return;
+  }
+  
+  // Get the target branch (either specified or current active)
+  const targetBranchId = branchId || message.activeBranchId;
+  const targetBranch = message.branches.find(b => b.id === targetBranchId);
+  
+  if (!targetBranch) {
+    console.warn(`[handleEventNavigate] Branch not found: ${targetBranchId}`);
+    return;
+  }
+  
+  // Build the ancestry chain: trace back through parentBranchId to find all branches we need to activate
+  const branchesToActivate: Array<{ messageId: string; branchId: string }> = [];
+  
+  // Add the target message's branch
+  if (message.activeBranchId !== targetBranchId) {
+    branchesToActivate.push({ messageId: message.id, branchId: targetBranchId });
+  }
+  
+  // Trace back through parent branches
+  let currentParentBranchId = targetBranch.parentBranchId;
+  while (currentParentBranchId) {
+    // Find the message that contains this branch
+    const parentMessage = store.state.allMessages.find(m => 
+      m.branches.some(b => b.id === currentParentBranchId)
+    );
+    
+    if (!parentMessage) break;
+    
+    // If parent message isn't on this branch, we need to switch it
+    if (parentMessage.activeBranchId !== currentParentBranchId) {
+      branchesToActivate.unshift({ messageId: parentMessage.id, branchId: currentParentBranchId });
+    }
+    
+    // Continue up the chain
+    const parentBranch = parentMessage.branches.find(b => b.id === currentParentBranchId);
+    currentParentBranchId = parentBranch?.parentBranchId || null;
+  }
+  
+  // Switch branches in batch for faster navigation
+  if (branchesToActivate.length > 0) {
+    console.log(`[handleEventNavigate] Batch switching ${branchesToActivate.length} branches`);
+    store.switchBranchesBatch(branchesToActivate);
+  }
+  
+  // Wait for DOM to update
+  await nextTick();
+  
+  // Then scroll to the message
+  scrollToMessage(messageId);
 }
 
 function scrollToTop() {
@@ -2925,6 +4573,54 @@ function getParticipantIcon(participant: Participant): string {
   return 'mdi-robot-outline';
 }
 
+// ==================== PER-USER UI STATE ====================
+// These persist speakingAs, selectedResponder, and detached mode per-user
+
+async function loadUserUIState() {
+  if (!currentConversation.value) return;
+  
+  try {
+    isLoadingUIState.value = true;
+    const response = await api.get(`/conversations/${currentConversation.value.id}/ui-state`);
+    const state = response.data;
+    
+    console.log('[ConversationView] Loaded UI state:', state);
+    
+    // Apply saved values if they exist and the participants are still valid
+    if (state.speakingAs) {
+      const participant = participants.value.find(p => p.id === state.speakingAs);
+      if (participant) {
+        selectedParticipant.value = state.speakingAs;
+      }
+    }
+    
+    if (state.selectedResponder) {
+      const participant = participants.value.find(p => p.id === state.selectedResponder);
+      if (participant) {
+        selectedResponder.value = state.selectedResponder;
+      }
+    }
+
+    // Note: isDetached and detachedBranches are now handled in store.loadConversation()
+  } catch (error) {
+    // Ignore errors - just use defaults
+    console.debug('[ConversationView] No saved UI state found');
+  } finally {
+    isLoadingUIState.value = false;
+  }
+}
+
+async function saveUserUIState(updates: { speakingAs?: string; selectedResponder?: string; isDetached?: boolean; detachedBranch?: { messageId: string; branchId: string } }) {
+  if (!currentConversation.value || isLoadingUIState.value) return;
+  
+  try {
+    await api.patch(`/conversations/${currentConversation.value.id}/ui-state`, updates);
+  } catch (error) {
+    // Non-critical - just log
+    console.debug('[ConversationView] Failed to save UI state:', error);
+  }
+}
+
 async function loadParticipants() {
   if (!currentConversation.value) return;
   
@@ -2936,8 +4632,10 @@ async function loadParticipants() {
     console.log('[ConversationView] Using cached participants');
     participants.value = cached;
     
-    // Set default selected participant
-    const defaultUser = participants.value.find(p => p.type === 'user' && p.isActive);
+    // Set default selected participant - prefer the one that belongs to the current user
+    const currentUserId = store.state.user?.id;
+    const ownParticipant = participants.value.find(p => p.type === 'user' && p.isActive && p.userId === currentUserId);
+    const defaultUser = ownParticipant || participants.value.find(p => p.type === 'user' && p.isActive);
     if (defaultUser) {
       selectedParticipant.value = defaultUser.id;
     }
@@ -2948,6 +4646,9 @@ async function loadParticipants() {
       console.log('[ConversationView] Setting selectedResponder to:', defaultAssistant.id, 'model:', defaultAssistant.model);
       selectedResponder.value = defaultAssistant.id;
     }
+    
+    // Load saved UI state (may override defaults)
+    await loadUserUIState();
     return;
   }
   
@@ -2959,8 +4660,10 @@ async function loadParticipants() {
     // Cache the loaded participants
     participantCache.set(currentConversation.value.id, response.data);
     
-    // Set default selected participant
-    const defaultUser = participants.value.find(p => p.type === 'user' && p.isActive);
+    // Set default selected participant - prefer the one that belongs to the current user
+    const currentUserId = store.state.user?.id;
+    const ownParticipant = participants.value.find(p => p.type === 'user' && p.isActive && p.userId === currentUserId);
+    const defaultUser = ownParticipant || participants.value.find(p => p.type === 'user' && p.isActive);
     if (defaultUser) {
       selectedParticipant.value = defaultUser.id;
     }
@@ -2971,6 +4674,9 @@ async function loadParticipants() {
       console.log('[ConversationView] Setting selectedResponder to:', defaultAssistant.id, 'model:', defaultAssistant.model);
       selectedResponder.value = defaultAssistant.id;
     }
+    
+    // Load saved UI state (may override defaults)
+    await loadUserUIState();
   } catch (error) {
     console.error('Failed to load participants:', error);
   }
@@ -3166,7 +4872,10 @@ async function updateParticipants(updatedParticipants: Participant[]) {
         const hasChanges = existing.name !== updated.name ||
           existing.model !== updated.model ||
           existing.systemPrompt !== updated.systemPrompt ||
+          existing.personaContext !== updated.personaContext ||
           existing.conversationMode !== updated.conversationMode ||
+          existing.pseudoPrefillMode !== updated.pseudoPrefillMode ||
+          existing.pseudoPrefillFilename !== updated.pseudoPrefillFilename ||
           !isEqual(existing.settings, updated.settings) ||
           !isEqual(existing.contextManagement, updated.contextManagement);
         
@@ -3181,9 +4890,12 @@ async function updateParticipants(updatedParticipants: Participant[]) {
             name: updated.name,
             model: updated.model,
             systemPrompt: updated.systemPrompt,
+            personaContext: updated.personaContext,
             settings: updated.settings,
             contextManagement: updated.contextManagement,
-            conversationMode: updated.conversationMode
+            conversationMode: updated.conversationMode,
+            pseudoPrefillMode: updated.pseudoPrefillMode,
+            pseudoPrefillFilename: updated.pseudoPrefillFilename
           });
           
           if (!parseResult.success) {
@@ -3382,9 +5094,13 @@ async function importRawMessages() {
 // The sidebar now uses embedded participant summaries from the backend
 // The active conversation uses loadParticipants() with smart caching
 
+function getConversationUnreadCount(conversationId: string): number {
+  return store.state.unreadCounts.get(conversationId) || 0;
+}
+
 function getConversationModelsHtml(conversation: any): string {
   if (!conversation) return '';
-  
+
   // For standard conversations, show the model name
   if (conversation.format === 'standard' || !conversation.format) {
     const model = store.state.models.find(m => m.id === conversation.model);
@@ -3431,6 +5147,67 @@ function formatDate(date: Date | string): string {
 </script>
 
 <style scoped>
+/* Unread badges - smaller, consistent style */
+.unread-history-badge :deep(.v-badge__badge),
+.sidebar-unread-badge :deep(.v-badge__badge) {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+/* Input bar button groups - consistent spacing */
+.input-bar-left,
+.input-bar-right {
+  gap: 4px;
+}
+
+/* Ensure icon buttons in input bar are consistent size */
+.input-bar-left :deep(.v-btn),
+.input-bar-right :deep(.v-btn) {
+  min-width: 32px;
+  height: 32px;
+}
+
+/* Sampling button - ensure consistent sizing whether showing count or not */
+.sampling-btn {
+  min-width: 32px !important;
+  padding: 0 6px !important;
+}
+
+.sampling-btn .sampling-count {
+  font-size: 11px;
+  margin-left: 2px;
+  font-weight: 600;
+}
+
+/* Send button gets a bit more margin for visual separation */
+.input-bar-right :deep(.v-btn.ml-1:last-child) {
+  margin-left: 8px !important;
+}
+
+/* Force multiline subtitles in content moderation dialog */
+.v-dialog :deep(.v-list-item-subtitle) {
+  -webkit-line-clamp: unset !important;
+  line-clamp: unset !important;
+  white-space: normal !important;
+  overflow: visible !important;
+  display: block !important;
+  line-height: 1.4;
+}
+
+/* Connection status indicator */
+.connection-status-bar {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  background: rgba(255, 152, 0, 0.1);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
 /* Custom scrollbar styles for better visibility in dark theme */
 .overflow-y-auto::-webkit-scrollbar {
   width: 12px;
@@ -3819,6 +5596,49 @@ function formatDate(date: Date | string): string {
   opacity: 0.9;
 }
 
+/* Bookmark browser button */
+.bookmark-browser-btn {
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.bookmark-browser-btn:hover {
+  opacity: 1;
+}
+
+/* Bookmark browser list */
+.bookmark-browser-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.bookmark-browser-list .meta-text {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.bookmark-browser-list .v-list-item {
+  border-left: 3px solid transparent;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+
+.bookmark-browser-list .v-list-item.bookmark-in-path {
+  border-left-color: rgb(var(--v-theme-primary));
+  background-color: rgba(var(--v-theme-primary), 0.08);
+}
+
+.bookmark-browser-list .v-list-item:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Bookmark preview text */
+.bookmark-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
 /* Drop zone styles for drag-and-drop attachments */
 .input-drop-zone {
   position: relative;
@@ -3848,5 +5668,66 @@ function formatDate(date: Date | string): string {
   justify-content: center;
   z-index: 10;
   pointer-events: none;
+}
+
+/* Message highlight animation for event history navigation */
+.highlight-flash {
+  animation: highlightPulse 1.5s ease-out;
+}
+
+@keyframes highlightPulse {
+  0% {
+    background-color: rgba(var(--v-theme-primary), 0.3);
+    box-shadow: 0 0 20px rgba(var(--v-theme-primary), 0.5);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: none;
+  }
+}
+
+/* Stuck button animation is now inline in MessageComponent */
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.3s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* Rolling-context window divider: appears above the first message inside the
+   current rolling window, so it's visible where the model's view actually
+   starts. Intentionally subtle — informational, not alarming. */
+.context-window-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 8px 8px;
+  opacity: 0.55;
+}
+.context-window-divider::before,
+.context-window-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px dashed currentColor;
+}
+.context-window-divider-label {
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Pre-send "context rolls this turn" warning, sits just above the composer */
+.context-roll-warning {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  color: rgb(var(--v-theme-warning));
+  opacity: 0.9;
 }
 </style>

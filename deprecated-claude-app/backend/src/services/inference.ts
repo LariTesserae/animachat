@@ -1,4 +1,4 @@
-import { Message, ConversationFormat, ConversationMode, ModelSettings, Participant, ApiKey, TokenUsage, Conversation, Model, PostHocOperation, MessageBranch, ContentBlock } from '@deprecated-claude/shared';
+import { Message, ConversationFormat, ConversationMode, ModelSettings, Participant, ApiKey, Conversation, Model, PostHocOperation, MessageBranch, ContentBlock, Attachment } from '@deprecated-claude/shared';
 import { Database } from '../database/index.js';
 import { BedrockService } from './bedrock.js';
 import { AnthropicService } from './anthropic.js';
@@ -9,13 +9,16 @@ import { ApiKeyManager } from './api-key-manager.js';
 import { ModelLoader } from '../config/model-loader.js';
 import { Logger } from '../utils/logger.js';
 import { ContextManager } from './context-manager.js';
+import { isImageFile } from './attachment-utils.js';
 
-// Internal format type that includes 'messages' and 'completion' modes
+// Internal format type that includes 'messages', 'completion', and 'pseudo-prefill' modes
 // - 'standard': Traditional alternating user/assistant (no participant names)
-// - 'prefill': Conversation log format with participant names
+// - 'prefill': Conversation log format with participant names (native prefill)
+// - 'pseudo-prefill': Conversation log format using CLI simulation trick (cut/cat)
+//   for models that don't support native prefill but benefit from log format
 // - 'messages': Like prefill but without actual prefill support (fallback)
 // - 'completion': OpenRouter completion mode (prompt field instead of messages)
-type InternalConversationFormat = ConversationFormat | 'messages' | 'completion';
+type InternalConversationFormat = ConversationFormat | 'messages' | 'completion' | 'pseudo-prefill';
 
 export class InferenceService {
   private bedrockService: BedrockService;
@@ -93,10 +96,10 @@ export class InferenceService {
     
     switch (model.provider) {
       case 'anthropic':
-        apiMessages = this.anthropicService.formatMessagesForAnthropic(formattedMessages);
+        apiMessages = await this.anthropicService.formatMessagesForAnthropic(formattedMessages);
         break;
       case 'bedrock':
-        apiMessages = this.bedrockService.formatMessagesForClaude(formattedMessages);
+        apiMessages = await this.bedrockService.formatMessagesForClaude(formattedMessages);
         break;
       case 'openai-compatible':
         // For prompt building, we don't need actual API keys, just format the messages
@@ -149,7 +152,8 @@ export class InferenceService {
     participants: Participant[] = [],
     responderId?: string,
     conversation?: Conversation,
-    cacheMarkerIndices?: number[]  // Message indices where to insert cache breakpoints (for prefill)
+    cacheMarkerIndices?: number[],  // Message indices where to insert cache breakpoints (for prefill)
+    personaContext?: string  // Per-participant persona context to inject into prefill
   ): Promise<{
     usage?: {
       inputTokens: number;
@@ -208,10 +212,15 @@ export class InferenceService {
     const processedMessages = this.applyPostHocOperations(contextMessages);
     
     // Format messages based on conversation format
-    // For prefill format with Anthropic direct, pass cache marker indices to insert breakpoints
-    const shouldInsertCacheBreakpoints = actualFormat === 'prefill' && model.provider === 'anthropic';
-    // Trigger thinking via <think> tag in prefill mode if thinking was enabled in settings
-    const shouldTriggerPrefillThinking = actualFormat === 'prefill' && settings.thinking?.enabled;
+    // For prefill format with Anthropic direct or Bedrock, pass cache marker
+    // indices to insert breakpoints (both formatters split at the markers)
+    const shouldInsertCacheBreakpoints = actualFormat === 'prefill' &&
+      (model.provider === 'anthropic' || model.provider === 'bedrock');
+    // Trigger thinking via <think> tag in prefill mode if thinking was enabled AND model supports it
+    // NOTE: In prefill mode, native thinking APIs don't work well (model is continuing a pre-filled response)
+    // So we use <think> tags to trigger pseudo-reasoning for all providers that support prefill
+    const supportsPrefillThinkingTags = model.provider === 'anthropic' || model.provider === 'bedrock' || (model.provider as string) === 'google';
+    const shouldTriggerPrefillThinking = actualFormat === 'prefill' && settings.thinking?.enabled && model.supportsThinking && supportsPrefillThinkingTags;
     const formattedMessages = this.formatMessagesForConversation(
       processedMessages,
       actualFormat,
@@ -220,14 +229,24 @@ export class InferenceService {
       model.provider,
       conversation,
       shouldInsertCacheBreakpoints ? cacheMarkerIndices : undefined,
-      shouldTriggerPrefillThinking
+      shouldTriggerPrefillThinking,
+      personaContext
     );
 
-    // For messages mode, provide a default system prompt if none is provided
+    // For messages/pseudo-prefill mode, provide a default system prompt if none is provided
     // This helps the model understand its role in a multi-participant chat
     // If user provides a custom prompt, use it as-is (full override)
     let effectiveSystemPrompt = systemPrompt;
-    if (actualFormat === 'messages' && responderId) {
+    if (actualFormat === 'pseudo-prefill') {
+      // Pseudo-prefill: append CLI simulation directive to system prompt
+      const cliDirective = 'The assistant is in CLI simulation mode, and responds to the user\'s CLI commands only with the output of the command.';
+      if (effectiveSystemPrompt && effectiveSystemPrompt.trim()) {
+        effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n${cliDirective}`;
+      } else {
+        effectiveSystemPrompt = cliDirective;
+      }
+      Logger.inference(`[InferenceService] Using pseudo-prefill system prompt with CLI directive`);
+    } else if (actualFormat === 'messages' && responderId) {
       const responder = participants.find(p => p.id === responderId);
       if (responder && (!effectiveSystemPrompt || effectiveSystemPrompt.trim() === '')) {
         const responderName = responder.name || 'Assistant';
@@ -245,18 +264,55 @@ export class InferenceService {
     }
 
     // Build stop sequences for prefill/messages formats
+    // NOTE: pseudo-prefill does NOT use API-level stop sequences because the model
+    // outputs the full file content (which starts with participant names that would
+    // trigger stop sequences prematurely). Post-facto stop sequences handle turn-taking.
     let stopSequences: string[] | undefined;
+    const responderForStopSequences = responderId
+      ? participants.find(p => p.id === responderId && p.name !== '')
+      : undefined;
+    const responderStopSequence = responderForStopSequences ? `${responderForStopSequences.name}:` : undefined;
     if (actualFormat === 'prefill' || actualFormat === 'messages') {
       // Always include these common stop sequences
-      const baseStopSequences = ['User:', 'A:', "Claude:"];
+      const baseStopSequences = ['User:', 'A:', "Claude:"].filter(s => s !== responderStopSequence);
       // Add participant names as stop sequences (excluding empty names and the current responder)
       // The responder must be excluded because the model will prefix its response with its own name
       const participantStopSequences = participants
         .filter(p => p.name !== '' && p.id !== responderId) // Exclude empty names and responder
         .map(p => `${p.name}:`);
-      // Combine and deduplicate
-      stopSequences = [...new Set([...baseStopSequences, ...participantStopSequences])];
+      
+      if (shouldTriggerPrefillThinking) {
+        // For prefill+thinking, use newline-prefixed stop sequences
+        // This prevents false matches in thinking blocks while still stopping the API
+        // when a new turn starts (which is always after \n\n in prefill format)
+        stopSequences = [...new Set([
+          ...baseStopSequences.map(s => `\n\n${s}`),
+          ...participantStopSequences.map(s => `\n\n${s}`)
+        ])];
+        console.log(`[InferenceService] Using newline-prefixed stop sequences for prefill+thinking: ${stopSequences.slice(0, 3).join(', ')}...`);
+      } else {
+        // Standard prefill - use exact stop sequences
+        stopSequences = [...new Set([...baseStopSequences, ...participantStopSequences])];
+      }
     }
+    
+    // Build post-facto stop sequences for prefill/messages modes
+    // NOTE: pseudo-prefill handles stop sequences in its own chunk handler (after log stripping)
+    // This is critical because:
+    // 1. Gemini only supports 5 stop sequences max
+    // 2. Native API stop sequences may not work reliably with all providers
+    // 3. We need a fallback to catch when models simulate other participants
+    // Since this is applied in our code, not the API, we can check for ALL participants
+    const needsPostFactoStopSequences = (actualFormat === 'prefill' || actualFormat === 'messages') && participants.length > 0;
+    const postFactoStopSequences = needsPostFactoStopSequences ? (() => {
+      const baseStopSequences = ['User:', 'A:', "Claude:"].filter(s => s !== responderStopSequence);
+      const participantStopSequences = participants
+        .filter(p => p.name !== '' && p.id !== responderId)
+        .map(p => `${p.name}:`);
+      const allSequences = [...new Set([...baseStopSequences, ...participantStopSequences])];
+      console.log(`[InferenceService] Post-facto stop sequences (${allSequences.length}): ${allSequences.slice(0, 5).join(', ')}${allSequences.length > 5 ? '...' : ''}`);
+      return allSequences;
+    })() : [];
 
     // Route to appropriate service based on provider
     // For custom models with embedded endpoints, skip API key manager
@@ -291,16 +347,36 @@ export class InferenceService {
     };
     
     // Wrap chunk handler for messages mode to strip participant names
-    let baseOnChunk = actualFormat === 'messages' 
-      ? this.createMessagesModeChunkHandler(trackingOnChunk, participants, responderId)
-      : trackingOnChunk;
+    // For pseudo-prefill, use a dedicated handler that strips the repeated conversation log
+    let baseOnChunk: typeof trackingOnChunk;
+    if (actualFormat === 'pseudo-prefill') {
+      // Get the conversation log that was embedded in the assistant turn.
+      const pseudoPrefillLog = formattedMessages.find(m => {
+        const branch = m.branches.find(b => b.id === m.activeBranchId);
+        return branch?.role === 'assistant';
+      });
+      const logContent = pseudoPrefillLog?.branches.find(b => b.id === pseudoPrefillLog.activeBranchId)?.content || '';
+      // Detect mode from the continuation command
+      const catMsg = formattedMessages[formattedMessages.length - 1];
+      const catContent = catMsg?.branches.find(b => b.id === catMsg.activeBranchId)?.content || '';
+      const ppMode: 'cat' | 'tail-cut' = catContent.includes('cat ') && !catContent.includes('cut ') ? 'cat' : 'tail-cut';
+      baseOnChunk = this.createPseudoPrefillChunkHandler(trackingOnChunk, logContent, participants, responderId, ppMode);
+    } else if (actualFormat === 'messages') {
+      baseOnChunk = this.createMessagesModeChunkHandler(trackingOnChunk, participants, responderId);
+    } else {
+      baseOnChunk = trackingOnChunk;
+    }
 
-    // In prefill mode, disable API thinking - it's incompatible with prefill format
-    // Thinking blocks are converted to <think> tags in formatMessagesForConversation instead
+    // In prefill mode, disable native API thinking - it's incompatible with prefill format
+    // (the model is continuing a pre-filled response, not generating fresh)
+    // Thinking is triggered via <think> tags in formatMessagesForConversation instead
     const effectiveSettings = { ...settings };
-    if (actualFormat === 'prefill' && effectiveSettings.thinking?.enabled) {
+    if (shouldTriggerPrefillThinking) {
       console.log('[InferenceService] Disabling API thinking for prefill format (using <think> tags instead)');
-      effectiveSettings.thinking = { ...effectiveSettings.thinking, enabled: false };
+      effectiveSettings.thinking = { 
+        enabled: false, 
+        budgetTokens: effectiveSettings.thinking?.budgetTokens ?? 0 
+      };
     }
     
     // Disable thinking if the model doesn't support it
@@ -319,14 +395,44 @@ export class InferenceService {
     // - Buffer thinking content until </think> is seen (don't add to content)
     // - Stream thinking updates via contentBlocks only
     // - After </think>, stream actual response text as normal content
+    // - Apply stop sequences post-facto on response content (not during thinking)
     let inThinkingMode = false;
     let thinkingBuffer = '';
     let thinkingComplete = false;
+    let responseHitStopSequence = false;
+    let earlyCompletionSent = false; // Track if we sent early completion due to stop sequence
+    let responseBuffer = ''; // Buffer to detect stop sequences across chunk boundaries
     const currentContentBlocks: any[] = [];
+    
+    // Helper to find stop sequences in text
+    // Stop sequences should only match at the start of a new turn (after \n\n) or at position 0
+    // This prevents false matches like "Dear aster: I want to help" from triggering
+    const findStopSequence = (text: string): { index: number; sequence: string } | null => {
+      for (const seq of postFactoStopSequences) {
+        // Check if sequence is at position 0 (start of response after </think>)
+        if (text.startsWith(seq)) {
+          return { index: 0, sequence: seq };
+        }
+        // Check for sequence after double newline (new turn indicator)
+        const turnIdx = text.indexOf('\n\n' + seq);
+        if (turnIdx !== -1) {
+          return { index: turnIdx + 2, sequence: seq }; // +2 to skip the \n\n
+        }
+      }
+      return null;
+    };
     
     const finalOnChunk = shouldTriggerPrefillThinking 
       ? async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
+          // If we already hit a stop sequence, ignore further chunks (except completion)
+          if (responseHitStopSequence && !isComplete) return;
+          
           if (isComplete) {
+            // Skip if we already sent early completion due to stop sequence
+            if (earlyCompletionSent) {
+              console.log(`[InferenceService] Skipping duplicate completion (early completion already sent)`);
+              return;
+            }
             // Finalize contentBlocks
             if (thinkingBuffer) {
               currentContentBlocks[0] = { type: 'thinking', thinking: thinkingBuffer.trimEnd() };
@@ -368,7 +474,37 @@ export class InferenceService {
               // Start streaming response content (without the tags, trim leading newlines)
               const trimmedAfterTag = afterTag.replace(/^[\n\r]+/, '');
               if (trimmedAfterTag) {
-                await baseOnChunk(trimmedAfterTag, false, currentContentBlocks);
+                // Check for stop sequence in initial response
+                const stopMatch = findStopSequence(trimmedAfterTag);
+                if (stopMatch) {
+                  responseHitStopSequence = true;
+                  const truncated = trimmedAfterTag.substring(0, stopMatch.index).trimEnd();
+                  if (stopMatch.index === 0) {
+                    // Stop sequence at position 0 means model tried to write as another participant
+                    console.log(`[InferenceService] ⚠️ Model attempted to write as "${stopMatch.sequence.replace(':', '')}" - response truncated`);
+                    console.log(`[InferenceService] Response preview: "${trimmedAfterTag.substring(0, 100)}..."`);
+                    // Send immediate completion - don't wait for API stream to finish
+                    // This clears the loading indicator on the client immediately
+                    console.log(`[InferenceService] Sending early completion (stop sequence at start)`);
+                    earlyCompletionSent = true;
+                    await baseOnChunk('', true, currentContentBlocks);
+                  } else {
+                    console.log(`[InferenceService] Stop sequence "${stopMatch.sequence}" found at position ${stopMatch.index}, truncating`);
+                  }
+                  if (truncated) {
+                    await baseOnChunk(truncated, false, currentContentBlocks);
+                  }
+                  // Send early completion to avoid waiting for API stream to finish
+                  // This prevents the loading indicator from staying on indefinitely
+                  if (!earlyCompletionSent) {
+                    console.log(`[InferenceService] Sending early completion (stop sequence found)`);
+                    earlyCompletionSent = true;
+                    await baseOnChunk('', true, currentContentBlocks);
+                  }
+                } else {
+                  responseBuffer = trimmedAfterTag;
+                  await baseOnChunk(trimmedAfterTag, false, currentContentBlocks);
+                }
               }
             } else {
               // Still in thinking mode - buffer thinking, send empty chunk with contentBlocks update
@@ -378,11 +514,78 @@ export class InferenceService {
               await baseOnChunk('', false, currentContentBlocks);
             }
           } else {
-            // After thinking, stream normal response content
-            await baseOnChunk(chunk, false, currentContentBlocks);
+            // After thinking, stream normal response content with stop sequence checking
+            responseBuffer += chunk;
+            
+            // Check for stop sequence in accumulated response
+            const stopMatch = findStopSequence(responseBuffer);
+            if (stopMatch) {
+              responseHitStopSequence = true;
+              console.log(`[InferenceService] Stop sequence "${stopMatch.sequence}" found at position ${stopMatch.index}, truncating response`);
+              // Calculate how much of this chunk to send
+              const totalBefore = responseBuffer.length - chunk.length;
+              const cutPoint = stopMatch.index - totalBefore;
+              if (cutPoint > 0) {
+                await baseOnChunk(chunk.substring(0, cutPoint).trimEnd(), false, currentContentBlocks);
+              }
+              // Send early completion to avoid waiting for API stream to finish
+              if (!earlyCompletionSent) {
+                console.log(`[InferenceService] Sending early completion (stop sequence in response)`);
+                earlyCompletionSent = true;
+                await baseOnChunk('', true, currentContentBlocks);
+              }
+            } else {
+              await baseOnChunk(chunk, false, currentContentBlocks);
+            }
           }
         }
-      : baseOnChunk;
+      // Case 2: Prefill/messages without thinking - just apply post-facto stop sequences
+      : (needsPostFactoStopSequences && postFactoStopSequences.length > 0)
+        ? async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
+            // If we already hit a stop sequence, ignore further chunks (except completion)
+            if (responseHitStopSequence && !isComplete) return;
+            
+            if (isComplete) {
+              // Skip if we already sent early completion due to stop sequence
+              if (earlyCompletionSent) {
+                console.log(`[InferenceService] Skipping duplicate completion (early completion already sent)`);
+                return;
+              }
+              await baseOnChunk('', true, contentBlocks, usage);
+              return;
+            }
+            
+            if (!chunk) {
+              await baseOnChunk(chunk, isComplete, contentBlocks, usage);
+              return;
+            }
+            
+            // Buffer content to detect stop sequences
+            responseBuffer += chunk;
+            
+            // Check for stop sequence in accumulated response
+            const stopMatch = findStopSequence(responseBuffer);
+            if (stopMatch) {
+              responseHitStopSequence = true;
+              console.log(`[InferenceService] Stop sequence "${stopMatch.sequence}" found at position ${stopMatch.index}, truncating response`);
+              // Calculate how much of this chunk to send
+              const totalBefore = responseBuffer.length - chunk.length;
+              const cutPoint = stopMatch.index - totalBefore;
+              if (cutPoint > 0) {
+                await baseOnChunk(chunk.substring(0, cutPoint).trimEnd(), false, contentBlocks);
+              }
+              // Send early completion to avoid waiting for API stream to finish
+              if (!earlyCompletionSent) {
+                console.log(`[InferenceService] Sending early completion (stop sequence in response)`);
+                earlyCompletionSent = true;
+                await baseOnChunk('', true, contentBlocks);
+              }
+            } else {
+              await baseOnChunk(chunk, false, contentBlocks);
+            }
+          }
+        // Case 3: Standard mode - just pass through
+        : baseOnChunk;
 
     let usageResult: { usage?: any; rawRequest?: any } = {};
 
@@ -401,7 +604,8 @@ export class InferenceService {
         effectiveSystemPrompt,
         effectiveSettings,
         finalOnChunk,
-        stopSequences
+        stopSequences,
+        model.reasoningDisplay
       );
     } else if (model.provider === 'bedrock') {
       if (!selectedKey) {
@@ -689,8 +893,45 @@ export class InferenceService {
       startIdx = messages.length - 1;
     }
     
-    const truncatedMessages = messages.slice(startIdx);
+    let truncatedMessages = messages.slice(startIdx);
     const droppedCount = startIdx;
+    
+    // If we only have 1 message and it exceeds available tokens, truncate its text content
+    // This handles the case where all messages were consolidated into a single oversized message
+    if (truncatedMessages.length === 1 && messageTokens[startIdx] > availableTokens) {
+      const msg = truncatedMessages[0];
+      const targetChars = availableTokens * 4; // rough tokens to chars
+      
+      console.log(`[Truncate] ⚠️ Single message exceeds context (${messageTokens[startIdx]} tokens > ${availableTokens} available)`);
+      console.log(`[Truncate] Truncating message text from head to fit ~${targetChars} chars`);
+      
+      // Handle different message formats
+      if (msg.branches && msg.branches[0]) {
+        const branch = msg.branches[0];
+        if (branch.content && branch.content.length > targetChars) {
+          // Keep the tail (most recent) part of the content
+          const truncatedContent = '...[earlier context truncated]...\n\n' + branch.content.slice(-targetChars);
+          truncatedMessages = [{
+            ...msg,
+            branches: [{
+              ...branch,
+              content: truncatedContent
+            }]
+          }];
+          keptTokens = Math.ceil(truncatedContent.length / 4);
+          console.log(`[Truncate] 📝 Truncated message content: ${branch.content.length} → ${truncatedContent.length} chars (~${keptTokens} tokens)`);
+        }
+      } else if (typeof msg.content === 'string' && msg.content.length > targetChars) {
+        // Direct content format
+        const truncatedContent = '...[earlier context truncated]...\n\n' + msg.content.slice(-targetChars);
+        truncatedMessages = [{
+          ...msg,
+          content: truncatedContent
+        }];
+        keptTokens = Math.ceil(truncatedContent.length / 4);
+        console.log(`[Truncate] 📝 Truncated message content: ${msg.content.length} → ${truncatedContent.length} chars (~${keptTokens} tokens)`);
+      }
+    }
     
     console.log(`[Truncate] 🔄 Auto-truncated: dropped ${droppedCount} messages, kept ${truncatedMessages.length} (~${keptTokens} tokens)`);
     
@@ -727,11 +968,48 @@ export class InferenceService {
     provider?: string,
     conversation?: Conversation,
     cacheMarkerIndices?: number[],  // Message indices where to insert cache breakpoints
-    triggerThinking?: boolean  // Add opening <think> tag for prefill thinking mode
+    triggerThinking?: boolean,  // Add opening <think> tag for prefill thinking mode
+    personaContext?: string  // Per-participant persona context to prepend in prefill mode
   ): Message[] {
+    // Expand prefixHistory from the first message into synthetic messages
+    // This handles forked conversations with compressed history
+    let expandedMessages = messages;
+    if (messages.length > 0) {
+      const firstMessage = messages[0];
+      const firstBranch = firstMessage.branches.find(b => b.id === firstMessage.activeBranchId);
+      const prefixHistory = (firstBranch as any)?.prefixHistory as Array<{ role: 'user' | 'assistant' | 'system'; content: string; participantId?: string; model?: string }> | undefined;
+      
+      if (prefixHistory && prefixHistory.length > 0) {
+        console.log(`[InferenceService] Expanding ${prefixHistory.length} prefixHistory entries for fork context`);
+        
+        // Create synthetic messages from prefixHistory
+        // Use participantId for proper name lookup (participants are copied during fork)
+        const syntheticMessages: Message[] = prefixHistory.map((entry, index) => ({
+          id: `prefix-history-${index}`,
+          conversationId: firstMessage.conversationId,
+          branches: [{
+            id: `prefix-history-branch-${index}`,
+            content: entry.content,
+            role: entry.role,
+            createdAt: new Date(0), // Epoch - these are historical
+            model: entry.model,
+            participantId: entry.participantId, // Use ID for proper lookup
+          } as any],
+          activeBranchId: `prefix-history-branch-${index}`,
+          order: index
+        }));
+        
+        // Prepend synthetic messages, then the actual messages (with adjusted orders)
+        expandedMessages = [
+          ...syntheticMessages,
+          ...messages.map((m, i) => ({ ...m, order: prefixHistory.length + i }))
+        ];
+      }
+    }
+    
     if (format === 'standard') {
-      // Standard format - pass through as-is
-      return messages;
+      // Standard format - pass through (with expanded prefixHistory if present)
+      return expandedMessages;
     }
     
     if (format === 'prefill') {
@@ -748,15 +1026,25 @@ export class InferenceService {
       }
       
       // Add initial user message if configured
+      // Note: Anthropic API accepts assistant-only messages for prefill, so this is optional
       const prefillSettings = conversation?.prefillUserMessage || { enabled: true, content: '<cmd>cat untitled.log</cmd>' };
       
-      if (prefillSettings.enabled) {
+      // Always inject persona context as the prefill user message if present,
+      // even when prefillSettings.enabled is false (otherwise the budget reserved
+      // by truncateForPersonaBudget is wasted and the persona is silently dropped)
+      const hasPersonaContext = personaContext && personaContext.trim();
+      if (prefillSettings.enabled || hasPersonaContext) {
+        let cmdContent = hasPersonaContext ? personaContext! : prefillSettings.content;
+        if (hasPersonaContext) {
+          Logger.inference(`[InferenceService] Injecting persona context (${Math.ceil(personaContext!.length / 4)} est. tokens) as prefill user message`);
+        }
+
         const cmdMessage: Message = {
           id: 'prefill-cmd',
-          conversationId: messages[0]?.conversationId || '',
+          conversationId: expandedMessages[0]?.conversationId || '',
           branches: [{
             id: 'prefill-cmd-branch',
-            content: prefillSettings.content,
+            content: cmdContent,
             role: 'user',
             createdAt: new Date(),
             isActive: true,
@@ -769,12 +1057,51 @@ export class InferenceService {
       }
       
       // Build the conversation content with participant names
+      // When we encounter images, we need to:
+      // 1. Close the current assistant message with content so far
+      // 2. Insert a user message with the image and its text
+      // 3. Start a new assistant segment for content after
+      
       let conversationContent = '';
       let lastMessageWasEmptyAssistant = false;
       let lastAssistantName = 'Assistant';
+      let lastParticipantName = ''; // Track previous participant for continuity
       let messageIndex = 0;  // Track index for cache breakpoints
+      let messageOrder = 1;  // For ordering output messages
       
-      for (const message of messages) {
+      // Helper to check if an attachment is an image with data to send.
+      const isImageAttachment = (attachment: any): boolean =>
+        isImageFile(attachment.fileName) && !!attachment.content;
+
+      // Helper to flush current conversation content as an assistant message
+      const flushAssistantContent = () => {
+        if (conversationContent.trim()) {
+          const assistantBranch: any = {
+            id: `prefill-assistant-branch-${messageOrder}`,
+            content: conversationContent.trim(),
+            role: 'assistant',
+            createdAt: new Date(),
+            isActive: true,
+            parentBranchId: 'prefill-cmd-branch'
+          };
+          
+          // Flag cache breakpoints if present
+          if (hasCacheMarkers && conversationContent.includes('<|cache_breakpoint|>')) {
+            assistantBranch._hasCacheBreakpoints = true;
+          }
+          
+          prefillMessages.push({
+            id: `prefill-assistant-${messageOrder}`,
+            conversationId: messages[0]?.conversationId || '',
+            branches: [assistantBranch],
+            activeBranchId: `prefill-assistant-branch-${messageOrder}`,
+            order: messageOrder++
+          });
+          conversationContent = '';
+        }
+      };
+      
+      for (const message of expandedMessages) {
         const activeBranch = message.branches.find(b => b.id === message.activeBranchId);
         if (!activeBranch) continue;
         
@@ -795,47 +1122,76 @@ export class InferenceService {
           continue; // Skip empty assistant messages
         }
         
-        // Build the message content with attachments
-        let messageContent = '';
+        // Check if this message has image attachments
+        const imageAttachments = (activeBranch.attachments || []).filter(isImageAttachment);
+        const hasImages = imageAttachments.length > 0;
         
-        // NOTE: Thinking blocks are NOT included in context for other participants
-        // Reasoning/thinking is private to each model and should not be shared
-        // This prevents models from seeing each other's internal reasoning
+        // Build the message content with text attachments
+        let messageContent = activeBranch.content;
         
-        // Add the main content only (no thinking blocks)
-        messageContent += activeBranch.content;
-        
-        // Append attachments for user messages
-        if (activeBranch.role === 'user' && activeBranch.attachments && activeBranch.attachments.length > 0) {
-          console.log(`[PREFILL] Appending ${activeBranch.attachments.length} attachments to ${participantName}'s message`);
+        // Handle non-image attachments (add inline)
+        if (activeBranch.attachments && activeBranch.attachments.length > 0) {
           for (const attachment of activeBranch.attachments) {
-            // Check if it's an image
-            const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-            const fileExtension = attachment.fileName?.split('.').pop()?.toLowerCase() || '';
-            const isImage = imageExtensions.includes(fileExtension);
-            
-            if (isImage) {
-              // For prefill format, we can't use image blocks, so describe it
-              messageContent += `\n\n[Image attachment: ${attachment.fileName}]`;
-              console.log(`[PREFILL] Added image reference: ${attachment.fileName}`);
-            } else {
-              // Add text attachments inline
+            if (!isImageAttachment(attachment)) {
+              // Add text/PDF attachments inline
               messageContent += `\n\n<attachment filename="${attachment.fileName}">\n${attachment.content}\n</attachment>`;
-              console.log(`[PREFILL] Added text attachment: ${attachment.fileName} (${attachment.content.length} chars)`);
+              console.log(`[PREFILL] Added text attachment: ${attachment.fileName}`);
             }
           }
         }
         
-        // If participant has no name (raw continuation), don't add prefix
-        if (participantName === '') {
-          conversationContent += `${messageContent}`;
+        if (hasImages) {
+          // Message has images - we need to insert it as a real user message
+          console.log(`[PREFILL] Message has ${imageAttachments.length} images, inserting as user message`);
+          
+          // First, flush any accumulated assistant content
+          flushAssistantContent();
+          
+          // Format the message text with participant name
+          const formattedText = participantName === '' 
+            ? messageContent 
+            : `${participantName}: ${messageContent}`;
+          
+          // Create user message with the text and actual image attachments
+          const userBranch: any = {
+            id: `prefill-image-user-branch-${messageOrder}`,
+            content: formattedText,
+            role: 'user',
+            createdAt: new Date(),
+            isActive: true,
+            parentBranchId: 'root',
+            attachments: imageAttachments
+          };
+          
+          prefillMessages.push({
+            id: `prefill-image-user-${messageOrder}`,
+            conversationId: messages[0]?.conversationId || '',
+            branches: [userBranch],
+            activeBranchId: `prefill-image-user-branch-${messageOrder}`,
+            order: messageOrder++
+          });
+          
+          console.log(`[PREFILL] Inserted user message with ${imageAttachments.length} image(s) at order ${messageOrder - 1}`);
+          // Reset participant tracking after image insertion
+          lastParticipantName = participantName;
+          // Reset empty assistant tracking - this is a non-empty message
+          lastMessageWasEmptyAssistant = false;
         } else {
-          // Use participant name format: "Name: content"
-          conversationContent += `${participantName}: ${messageContent}\n\n`;
+          // No images - add to conversation content as usual
+          if (participantName === '') {
+            conversationContent += `${messageContent}`;
+          } else if (participantName === lastParticipantName && lastParticipantName !== '') {
+            // Same participant as before - continue without prefix, just trim and append
+            conversationContent = conversationContent.trimEnd() + ' ' + messageContent.trimStart() + '\n\n';
+          } else {
+            conversationContent += `${participantName}: ${messageContent}\n\n`;
+          }
+          lastParticipantName = participantName;
+          // Reset empty assistant tracking - this is a non-empty message
+          lastMessageWasEmptyAssistant = false;
         }
         
-        // Insert cache breakpoint marker AFTER this message if it's a cache boundary
-        // Cache breakpoints go after the message at that index (so content before is cached)
+        // Insert cache breakpoint marker if needed
         if (cacheBreakpointIndices.has(messageIndex)) {
           conversationContent += '<|cache_breakpoint|>';
           console.log(`[PREFILL] 📍 Inserted cache breakpoint after message ${messageIndex} (${participantName})`);
@@ -844,24 +1200,25 @@ export class InferenceService {
         messageIndex++;
       }
       
-      // If the last message was an empty assistant, append that assistant's name
-      // Add opening <think> tag if thinking is triggered in prefill mode
-      // Note: No trailing whitespace allowed by Anthropic API
+      // Add final assistant segment with responder name
       const thinkingPrefix = triggerThinking ? ' <think>' : '';
       
       if (lastMessageWasEmptyAssistant) {
-        // If the assistant has no name (raw continuation), don't add any prefix
         if (lastAssistantName === '') {
+          conversationContent = conversationContent.trim() + thinkingPrefix;
+        } else if (lastAssistantName === lastParticipantName) {
+          // Same participant - just continue without name
           conversationContent = conversationContent.trim() + thinkingPrefix;
         } else {
           conversationContent = conversationContent.trim() + `\n\n${lastAssistantName}:${thinkingPrefix}`;
         }
       } else if (responderId && participants.length > 0) {
-        // Otherwise, if we have a responder, append their name with a colon (no newline)
         const responder = participants.find(p => p.id === responderId);
         if (responder) {
-          // If responder has no name (raw continuation), don't add any prefix
           if (responder.name === '') {
+            conversationContent = conversationContent.trim() + thinkingPrefix;
+          } else if (responder.name === lastParticipantName) {
+            // Same participant as last message - continue without name prefix
             conversationContent = conversationContent.trim() + thinkingPrefix;
           } else {
             conversationContent = conversationContent.trim() + `\n\n${responder.name}:${thinkingPrefix}`;
@@ -869,36 +1226,227 @@ export class InferenceService {
         }
       }
       
-      
-      // Create assistant message with the conversation content
-      const assistantBranch: any = {
-        id: 'prefill-assistant-branch',
-        content: conversationContent,
-        role: 'assistant',
-        createdAt: new Date(),
-        isActive: true,
-        parentBranchId: 'prefill-cmd-branch'
-      };
-      
-      // Flag that this content has cache breakpoint markers for Anthropic to process
-      // This uses the Chapter II approach: markers in text, converted to cache_control blocks
-      if (hasCacheMarkers && conversationContent.includes('<|cache_breakpoint|>')) {
-        assistantBranch._hasCacheBreakpoints = true;
-        console.log(`[PREFILL] 📦 Content has ${cacheBreakpointIndices.size} cache breakpoints (${conversationContent.length} chars total)`);
+      // Flush final assistant content
+      if (conversationContent.trim()) {
+        const assistantBranch: any = {
+          id: `prefill-assistant-branch-${messageOrder}`,
+          content: conversationContent.trim(),
+          role: 'assistant',
+          createdAt: new Date(),
+          isActive: true,
+          parentBranchId: 'prefill-cmd-branch'
+        };
+        
+        if (hasCacheMarkers && conversationContent.includes('<|cache_breakpoint|>')) {
+          assistantBranch._hasCacheBreakpoints = true;
+          console.log(`[PREFILL] 📦 Final content has cache breakpoints (${conversationContent.length} chars total)`);
+        }
+        
+        prefillMessages.push({
+          id: `prefill-assistant-${messageOrder}`,
+          conversationId: messages[0]?.conversationId || '',
+          branches: [assistantBranch],
+          activeBranchId: `prefill-assistant-branch-${messageOrder}`,
+          order: messageOrder
+        });
       }
       
-      const assistantMessage: Message = {
-        id: 'prefill-assistant',
-        conversationId: messages[0]?.conversationId || '',
-        branches: [assistantBranch],
-        activeBranchId: 'prefill-assistant-branch',
-        order: 1
-      };
-      prefillMessages.push(assistantMessage);
+      console.log(`[PREFILL] Generated ${prefillMessages.length} messages (with ${prefillMessages.filter(m => (m.branches[0] as any)?.attachments?.length > 0).length} containing images)`);
       
       return prefillMessages;
     }
     
+    if (format === 'pseudo-prefill') {
+      // Pseudo-prefill: build conversation log (same as prefill) but wrap in CLI simulation.
+      // Structure: user(cut -c 1-N), assistant(conversation log), user(cat filename)
+      // The model sees the full log as context and continues from where the cut left off.
+      const pseudoPrefillMessages: Message[] = [];
+      const responderParticipant = responderId ? participants.find(p => p.id === responderId) : undefined;
+      const filename = responderParticipant?.pseudoPrefillFilename || 'conversation.txt';
+      let messageOrder = 0;
+
+      // Build conversation log (same logic as prefill branch, minus cache breakpoints)
+      let conversationContent = '';
+      let lastParticipantName = '';
+
+      // Inject persona context at the start of the log if present
+      if (personaContext && personaContext.trim()) {
+        conversationContent += personaContext.trim() + '\n\n';
+        Logger.inference(`[PseudoPrefill] Injecting persona context (${Math.ceil(personaContext.length / 4)} est. tokens) into conversation log`);
+      }
+
+      // Helper to check if an attachment is an image with data to send.
+      const isImageAttachmentPP = (attachment: any): boolean =>
+        isImageFile(attachment.fileName) && !!attachment.content;
+
+      // Track image messages that need separate user turns
+      const imageTurns: Message[] = [];
+
+      // Helper to flush current log as an assistant message and create image user turn
+      const flushAndInsertImage = (participantName: string, messageContent: string, imageAttachments: any[]) => {
+        // The image turn will be inserted between assistant log and cat command
+        const formattedText = participantName === '' ? messageContent : `${participantName}: ${messageContent}`;
+        const imgBranchId = `pseudo-prefill-img-branch-${imageTurns.length}`;
+        imageTurns.push({
+          id: `pseudo-prefill-img-${imageTurns.length}`,
+          conversationId: expandedMessages[0]?.conversationId || '',
+          branches: [{
+            id: imgBranchId,
+            content: formattedText,
+            role: 'user',
+            createdAt: new Date(),
+            isActive: true,
+            parentBranchId: 'root',
+            attachments: imageAttachments,
+          } as any],
+          activeBranchId: imgBranchId,
+          order: 0,
+        });
+        console.log(`[PseudoPrefill] Queued image user turn with ${imageAttachments.length} image(s)`);
+      };
+
+      for (const message of expandedMessages) {
+        const activeBranch = message.branches.find(b => b.id === message.activeBranchId);
+        if (!activeBranch) continue;
+
+        // Find participant name
+        let participantName = activeBranch.role === 'user' ? 'User' : 'Assistant';
+        if (activeBranch.participantId) {
+          const participant = participants.find(p => p.id === activeBranch.participantId);
+          if (participant) {
+            participantName = participant.name;
+          }
+        }
+
+        // Skip empty assistant messages (completion targets)
+        if (activeBranch.role === 'assistant' && activeBranch.content === '') continue;
+
+        // Build message content with text attachments
+        let messageContent = activeBranch.content;
+        if (activeBranch.attachments && activeBranch.attachments.length > 0) {
+          for (const attachment of activeBranch.attachments) {
+            if (!isImageAttachmentPP(attachment)) {
+              messageContent += `\n\n<attachment filename="${attachment.fileName}">\n${attachment.content}\n</attachment>`;
+            }
+          }
+        }
+
+        // Check for image attachments
+        const imageAttachments = (activeBranch.attachments || []).filter(isImageAttachmentPP);
+        if (imageAttachments.length > 0) {
+          flushAndInsertImage(participantName, messageContent, imageAttachments);
+          lastParticipantName = participantName;
+          continue;
+        }
+
+        // Add to conversation log (same format as prefill)
+        if (participantName === '') {
+          conversationContent += `${messageContent}`;
+        } else if (participantName === lastParticipantName && lastParticipantName !== '') {
+          conversationContent = conversationContent.trimEnd() + ' ' + messageContent.trimStart() + '\n\n';
+        } else {
+          conversationContent += `${participantName}: ${messageContent}\n\n`;
+        }
+        lastParticipantName = participantName;
+      }
+
+      // Add responder turn prefix at end of log
+      if (responderId && participants.length > 0) {
+        const responder = participants.find(p => p.id === responderId);
+        if (responder && responder.name !== '' && responder.name !== lastParticipantName) {
+          conversationContent = conversationContent.trim() + `\n\n${responder.name}:`;
+        } else if (responder && (responder.name === '' || responder.name === lastParticipantName)) {
+          conversationContent = conversationContent.trim();
+        }
+      }
+
+      const conversationLog = conversationContent.trim();
+      const charCount = conversationLog.length;
+
+      // User: cut command (wrapped in <cmd> tags for CLI simulation)
+      const cutBranchId = `pseudo-prefill-cut-branch`;
+      pseudoPrefillMessages.push({
+        id: 'pseudo-prefill-cut',
+        conversationId: expandedMessages[0]?.conversationId || '',
+        branches: [{
+          id: cutBranchId,
+          content: `<cmd>cut -c 1-${charCount} < ${filename}</cmd>`,
+          role: 'user',
+          createdAt: new Date(),
+          isActive: true,
+          parentBranchId: 'root',
+        } as any],
+        activeBranchId: cutBranchId,
+        order: messageOrder++,
+      });
+
+      // Assistant: the conversation log
+      const logBranchId = `pseudo-prefill-log-branch`;
+      pseudoPrefillMessages.push({
+        id: 'pseudo-prefill-log',
+        conversationId: expandedMessages[0]?.conversationId || '',
+        branches: [{
+          id: logBranchId,
+          content: conversationLog,
+          role: 'assistant',
+          createdAt: new Date(),
+          isActive: true,
+          parentBranchId: cutBranchId,
+        } as any],
+        activeBranchId: logBranchId,
+        order: messageOrder++,
+      });
+
+      // Insert image turns between log and cat command
+      for (const imageTurn of imageTurns) {
+        // Brief assistant acknowledgment to maintain alternating turns
+        const ackBranchId = `pseudo-prefill-ack-branch-${messageOrder}`;
+        pseudoPrefillMessages.push({
+          id: `pseudo-prefill-ack-${messageOrder}`,
+          conversationId: expandedMessages[0]?.conversationId || '',
+          branches: [{
+            id: ackBranchId,
+            content: '[image received]',
+            role: 'assistant',
+            createdAt: new Date(),
+            isActive: true,
+            parentBranchId: 'root',
+          } as any],
+          activeBranchId: ackBranchId,
+          order: messageOrder++,
+        });
+        imageTurn.order = messageOrder++;
+        pseudoPrefillMessages.push(imageTurn);
+      }
+
+      // User: continuation command
+      // Two modes available:
+      // - 'cat': model repeats entire file, we strip the prefix (more reliable, higher output tokens)
+      // - 'tail-cut': model outputs only new content (efficient, needs simulated stop sequences)
+      const pseudoPrefillMode = responderParticipant?.pseudoPrefillMode || 'cat';
+      const continuationContent = pseudoPrefillMode === 'tail-cut'
+        ? `<cmd>cut -c ${charCount + 1}- < ${filename}</cmd>`
+        : `<cmd>cat ${filename}</cmd>`;
+      const catBranchId = `pseudo-prefill-cat-branch`;
+      pseudoPrefillMessages.push({
+        id: 'pseudo-prefill-cat',
+        conversationId: expandedMessages[0]?.conversationId || '',
+        branches: [{
+          id: catBranchId,
+          content: continuationContent,
+          role: 'user',
+          createdAt: new Date(),
+          isActive: true,
+          parentBranchId: logBranchId,
+        } as any],
+        activeBranchId: catBranchId,
+        order: messageOrder++,
+      });
+
+      console.log(`[PseudoPrefill] Generated ${pseudoPrefillMessages.length} messages (log: ${charCount} chars, ${imageTurns.length} image turns)`);
+      return pseudoPrefillMessages;
+    }
+
     if (format === 'messages') {
       // Messages mode - format for providers that don't support prefill
       const messagesFormatted: Message[] = [];
@@ -914,7 +1462,7 @@ export class InferenceService {
         }
       }
       
-      for (const message of messages) {
+      for (const message of expandedMessages) {
         const activeBranch = message.branches.find(b => b.id === message.activeBranchId);
         if (!activeBranch || activeBranch.content === '') continue;
         
@@ -939,21 +1487,23 @@ export class InferenceService {
         if (participantName === '') {
           // Raw continuation - no prefix
           formattedContent = activeBranch.content;
-        } else if (role === 'assistant' && provider === 'openai-compatible') {
-          // OpenAI-compatible model's own messages - no prefix (prevents name echoing)
+        } else if (role === 'assistant' && (provider === 'openai-compatible' || provider === 'openrouter' || provider === 'anthropic' || provider === 'bedrock')) {
+          // Assistant's own messages - no prefix (prevents the model from echoing its name,
+          // which triggers stop sequences in messages mode)
           formattedContent = activeBranch.content;
         } else {
-          // All other messages - add name prefix
+          // All other messages (user messages, other participants) - add name prefix
           formattedContent = `${participantName}: ${activeBranch.content}`;
         }
         
         // Handle attachments for non-responder messages
+        // Note: We add text references AND preserve the actual attachments
+        // Text references go in the transcript, but actual image/PDF data is preserved
+        // on the branch for providers (like Anthropic) that support multimodal inputs
         if (role === 'user' && activeBranch.attachments && activeBranch.attachments.length > 0) {
           for (const attachment of activeBranch.attachments) {
-            const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-            const fileExtension = attachment.fileName?.split('.').pop()?.toLowerCase() || '';
-            const isImage = imageExtensions.includes(fileExtension);
-            
+            const isImage = isImageFile(attachment.fileName);
+
             if (isImage) {
               formattedContent += `\n\n[Image attachment: ${attachment.fileName}]`;
             } else {
@@ -973,6 +1523,11 @@ export class InferenceService {
           participantId: activeBranch.participantId
         };
         
+        // Preserve attachments for providers that support multimodal inputs
+        if (role === 'user' && activeBranch.attachments && activeBranch.attachments.length > 0) {
+          formattedBranch.attachments = activeBranch.attachments;
+        }
+        
         // Preserve cache control metadata for providers that support it
         if ((activeBranch as any)._cacheControl) {
           formattedBranch._cacheControl = (activeBranch as any)._cacheControl;
@@ -989,8 +1544,10 @@ export class InferenceService {
         messagesFormatted.push(formattedMessage);
       }
       
-      // For Bedrock, we need to consolidate consecutive user messages
-      if (provider === 'bedrock') {
+      // Consolidate consecutive same-role messages if enabled or required for provider
+      // Bedrock always requires alternating turns
+      const shouldCombine = conversation?.combineConsecutiveMessages ?? true;
+      if (provider === 'bedrock' || shouldCombine) {
         return this.consolidateConsecutiveMessages(messagesFormatted);
       }
       
@@ -1025,47 +1582,22 @@ export class InferenceService {
   private consolidateConsecutiveMessages(messages: Message[]): Message[] {
     const consolidated: Message[] = [];
     let currentUserContent: string[] = [];
+    // Image attachments from accumulated user messages must be carried onto
+    // the consolidated branch — otherwise images silently disappear for any
+    // responder in messages mode (providers read attachments off the branch).
+    // Only images: text/PDF attachments are already inlined into the message
+    // content by the messages-mode formatter, so carrying them through would
+    // duplicate them when the provider formatter inlines them again.
+    let currentUserAttachments: Attachment[] = [];
+    // Cache breakpoints land on user branches (OpenRouter workaround in the
+    // marker-placement code), so they must survive consolidation too — a
+    // marker anywhere in the merged group moves to the consolidated branch.
+    let currentUserCacheControl: any = undefined;
     let lastRole: string | null = null;
-    
-    for (const message of messages) {
-      const activeBranch = message.branches.find(b => b.id === message.activeBranchId);
-      if (!activeBranch) continue;
-      
-      if (activeBranch.role === 'user') {
-        // Accumulate user messages
-        currentUserContent.push(activeBranch.content);
-        lastRole = 'user';
-      } else {
-        // If we have accumulated user messages, add them as a single message
-        if (currentUserContent.length > 0) {
-          const branchId = `consolidated-branch-${Date.now()}-${Math.random()}`;
-          const consolidatedMessage: Message = {
-            id: `consolidated-${Date.now()}-${Math.random()}`,
-            conversationId: messages[0].conversationId,
-            branches: [{
-              id: branchId,
-              content: currentUserContent.join('\n\n'),
-              role: 'user',
-              createdAt: new Date(),
-              isActive: true,
-              parentBranchId: messages[0].branches[0].parentBranchId,
-              participantId: undefined
-            }],
-            activeBranchId: branchId,
-            order: consolidated.length
-          };
-          consolidated.push(consolidatedMessage);
-          currentUserContent = [];
-        }
-        
-        // Add the assistant message
-        consolidated.push(message);
-        lastRole = 'assistant';
-      }
-    }
-    
-    // Don't forget any remaining user messages
-    if (currentUserContent.length > 0) {
+
+    // Flush accumulated user messages as a single consolidated user message
+    const flushUserMessages = () => {
+      if (currentUserContent.length === 0) return;
       const branchId = `consolidated-branch-${Date.now()}-${Math.random()}`;
       const consolidatedMessage: Message = {
         id: `consolidated-${Date.now()}-${Math.random()}`,
@@ -1077,14 +1609,48 @@ export class InferenceService {
           createdAt: new Date(),
           isActive: true,
           parentBranchId: messages[0].branches[0].parentBranchId,
-          participantId: undefined
-        }],
+          participantId: undefined,
+          ...(currentUserAttachments.length > 0 ? { attachments: currentUserAttachments } : {}),
+          ...(currentUserCacheControl ? { _cacheControl: currentUserCacheControl } : {})
+        } as any],
         activeBranchId: branchId,
         order: consolidated.length
       };
       consolidated.push(consolidatedMessage);
+      currentUserContent = [];
+      currentUserAttachments = [];
+      currentUserCacheControl = undefined;
+    };
+
+    for (const message of messages) {
+      const activeBranch = message.branches.find(b => b.id === message.activeBranchId);
+      if (!activeBranch) continue;
+
+      if (activeBranch.role === 'user') {
+        // Accumulate user messages
+        currentUserContent.push(activeBranch.content);
+        if (activeBranch.attachments && activeBranch.attachments.length > 0) {
+          currentUserAttachments.push(...activeBranch.attachments.filter(
+            att => isImageFile(att.fileName) && !!att.content
+          ));
+        }
+        if ((activeBranch as any)._cacheControl) {
+          currentUserCacheControl = (activeBranch as any)._cacheControl;
+        }
+        lastRole = 'user';
+      } else {
+        // If we have accumulated user messages, add them as a single message
+        flushUserMessages();
+
+        // Add the assistant message
+        consolidated.push(message);
+        lastRole = 'assistant';
+      }
     }
-    
+
+    // Don't forget any remaining user messages
+    flushUserMessages();
+
     console.log(`[Messages Mode] Consolidated ${messages.length} messages into ${consolidated.length} messages for Bedrock compatibility`);
     return consolidated;
   }
@@ -1146,6 +1712,14 @@ export class InferenceService {
           }
           Logger.warn(`[InferenceService] Participant requested prefill but model ${model.id} doesn't support it, using messages`);
           return 'messages';
+
+        case 'pseudo-prefill':
+          // Explicit pseudo-prefill request (CLI simulation trick)
+          if (model.provider === 'anthropic' || model.provider === 'bedrock') {
+            return 'pseudo-prefill';
+          }
+          Logger.warn(`[InferenceService] Pseudo-prefill only works with Anthropic/Bedrock, using messages`);
+          return 'messages';
           
         case 'messages':
           // Force messages mode (no prefill)
@@ -1165,7 +1739,7 @@ export class InferenceService {
     if (this.modelSupportsPrefill(model)) {
       return 'prefill';
     }
-    
+
     Logger.inference(`[InferenceService] Model ${model.id} doesn't support prefill, using messages mode`);
     return 'messages';
   }
@@ -1358,6 +1932,210 @@ export class InferenceService {
     return contentBlocks;
   }
   
+  /**
+   * Chunk handler for pseudo-prefill mode.
+   *
+   * The model outputs the full file (conversation log + new response). We need to:
+   * 1. Buffer output until we've consumed past the known conversation log
+   * 2. Strip the repeated log prefix
+   * 3. Strip the responder's "Name: " prefix from the new content
+   * 4. Only then start emitting content to the client
+   */
+  /**
+   * Chunk handler for pseudo-prefill mode.
+   *
+   * Two modes:
+   * - 'cat': Model repeats the full file (log + new content). We buffer until
+   *   the repeated log is consumed, strip it, strip responder name, then emit.
+   *   Stop sequences are checked only on new content after the log.
+   *
+   * - 'tail-cut': Model outputs only new content (starting with "ResponderName: ...").
+   *   No log stripping needed. "Simulated" stop sequences fire only after \n\n
+   *   (not at position 0, since the responder name is expected there).
+   */
+  private createPseudoPrefillChunkHandler(
+    originalOnChunk: (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => Promise<void>,
+    conversationLog: string,
+    participants: Participant[],
+    responderId?: string,
+    mode: 'cat' | 'tail-cut' = 'cat'
+  ): (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => Promise<void> {
+    let buffer = '';
+    let logStripped = mode === 'tail-cut'; // tail-cut skips log stripping
+    let nameStripped = false;
+    let hitStopSequence = false;
+    let completionSent = false;
+    let emittedContent = ''; // Track emitted content for stop detection
+    const logLength = conversationLog.length;
+
+    // Get responder name for stripping
+    let responderName = 'Assistant';
+    if (responderId) {
+      const responder = participants.find(p => p.id === responderId);
+      if (responder) {
+        responderName = responder.name;
+      }
+    }
+
+    // Escape regex metacharacters in responder name (user-supplied)
+    const escapedResponderName = responderName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // The responder turn prefix that marks the end of the log.
+    // The model's reproduction won't be byte-for-byte, but this pattern
+    // will appear at roughly the expected position.
+    const responderTurnPrefix = `\n\n${responderName}:`;
+
+    // Build stop sequences (excluding responder)
+    const baseStopSequences = ['User:', 'A:', 'Claude:'];
+    const participantStopSequences = participants
+      .filter(p => p.name !== '' && p.id !== responderId)
+      .map(p => `${p.name}:`);
+    const stopSequences = [...new Set([...baseStopSequences, ...participantStopSequences])];
+
+    // Check for stop sequences
+    // In 'cat' mode: check at position 0 and after \n\n (log already stripped)
+    // In 'tail-cut' mode: only check after \n\n (position 0 is the responder name)
+    const findStop = (text: string): { index: number; sequence: string } | null => {
+      for (const seq of stopSequences) {
+        // Position 0 check only in cat mode (tail-cut expects responder name at pos 0)
+        if (mode === 'cat' && text.startsWith(seq)) {
+          return { index: 0, sequence: seq };
+        }
+        // Turn boundary check (both modes)
+        const turnIdx = text.indexOf('\n\n' + seq);
+        if (turnIdx !== -1) return { index: turnIdx + 2, sequence: seq };
+      }
+      return null;
+    };
+
+    console.log(`[PseudoPrefill] Chunk handler: mode=${mode}, logLength=${logLength}, responder="${responderName}", stops=${stopSequences.length}`);
+
+    // Emit content with stop sequence checking
+    const emitWithStopCheck = async (text: string, contentBlocks?: any[]) => {
+      if (hitStopSequence || !text) return;
+      emittedContent += text;
+      const stop = findStop(emittedContent);
+      if (stop) {
+        hitStopSequence = true;
+        // Calculate how much of the CURRENT text to emit
+        const prevLen = emittedContent.length - text.length;
+        const cutInText = stop.index - prevLen;
+        const before = cutInText > 0 ? text.substring(0, cutInText).trimEnd() : '';
+        console.log(`[PseudoPrefill] Stop "${stop.sequence}" at pos ${stop.index}, truncating`);
+        if (before) await originalOnChunk(before, false, contentBlocks);
+        completionSent = true;
+        await originalOnChunk('', true, contentBlocks);
+      } else {
+        await originalOnChunk(text, false, contentBlocks);
+      }
+    };
+
+    return async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
+      if (hitStopSequence && !isComplete) return;
+
+      if (isComplete) {
+        if (completionSent) return;
+        // If log hasn't been stripped yet (short response in cat mode),
+        // apply stripping now before flushing
+        if (buffer.length > 0 && !logStripped) {
+          const lastPrefixIdx = buffer.lastIndexOf(responderTurnPrefix);
+          if (lastPrefixIdx >= 0) {
+            buffer = buffer.substring(lastPrefixIdx + responderTurnPrefix.length).replace(/^\s+/, '');
+            logStripped = true;
+            nameStripped = true;
+            console.log(`[PseudoPrefill] Late log strip on completion (short response), remaining: ${buffer.length} chars`);
+          } else {
+            // No responder prefix found at all — emit raw as fallback
+            logStripped = true;
+            console.log(`[PseudoPrefill] WARNING: no responder prefix on completion, emitting raw buffer (${buffer.length} chars)`);
+          }
+        }
+        if (buffer.length > 0 && logStripped) {
+          if (!nameStripped) {
+            const namePattern = new RegExp(`^\\s*${escapedResponderName}:\\s*`);
+            buffer = buffer.replace(namePattern, '');
+            nameStripped = true;
+          }
+          await emitWithStopCheck(buffer, contentBlocks);
+          buffer = '';
+        }
+        if (!completionSent) {
+          await originalOnChunk('', true, contentBlocks, usage);
+        }
+        return;
+      }
+
+      buffer += chunk;
+
+      // Phase 1: Strip the repeated conversation log (cat mode only)
+      //
+      // The model doesn't reproduce the log byte-for-byte — it creatively continues
+      // the conversation, often expanding messages. So we can't strip a fixed char count.
+      //
+      // Strategy: buffer the output and track the last occurrence of "\n\nResponderName:".
+      // The model's actual NEW response always comes after the LAST such prefix.
+      // Once we see enough content (50+ chars) after the last prefix without another
+      // participant turn starting, we're confident that's the real response.
+      if (!logStripped) {
+        const lastPrefixIdx = buffer.lastIndexOf(responderTurnPrefix);
+
+        if (lastPrefixIdx >= 0) {
+          const afterPrefix = buffer.substring(lastPrefixIdx + responderTurnPrefix.length);
+          // Check if there's enough content after the prefix to confirm it's the real response
+          // (not just a turn prefix in the middle of the reproduction)
+          const minContentAfterPrefix = 50;
+
+          if (afterPrefix.length >= minContentAfterPrefix) {
+            // Confident this is the real response — strip everything before it
+            buffer = afterPrefix.replace(/^\s+/, '');
+            logStripped = true;
+            nameStripped = true; // Turn prefix includes "Name:"
+            console.log(`[PseudoPrefill] Log stripped at last responder prefix (pos ${lastPrefixIdx}), response: ${buffer.length} chars`);
+            if (buffer.length > 0) {
+              await emitWithStopCheck(buffer, contentBlocks);
+              buffer = '';
+            }
+            return;
+          }
+        }
+
+        // Safety: if buffer grows way beyond expected log size and we never found
+        // the responder prefix, something is wrong. Emit everything as-is.
+        if (buffer.length > logLength * 5 && lastPrefixIdx < 0) {
+          console.log(`[PseudoPrefill] WARNING: buffer at ${buffer.length} chars, no responder prefix found. Emitting raw.`);
+          logStripped = true;
+          // Fall through to name stripping
+        } else {
+          return; // Keep buffering
+        }
+      }
+
+      // Phase 2: Strip responder name prefix
+      if (!nameStripped) {
+        const namePattern = new RegExp(`^\\s*${escapedResponderName}:\\s*`);
+        if (namePattern.test(buffer)) {
+          buffer = buffer.replace(namePattern, '');
+          nameStripped = true;
+          console.log(`[PseudoPrefill] Stripped responder name "${responderName}:"`);
+          if (buffer.length > 0) {
+            await emitWithStopCheck(buffer, contentBlocks);
+            buffer = '';
+          }
+        } else if (buffer.length > responderName.length + 5) {
+          // Enough buffer, no name prefix found
+          nameStripped = true;
+          await emitWithStopCheck(buffer, contentBlocks);
+          buffer = '';
+        }
+        return;
+      }
+
+      // Phase 3: Normal streaming with stop sequence checking
+      await emitWithStopCheck(chunk, contentBlocks);
+      buffer = '';
+    };
+  }
+
   private createMessagesModeChunkHandler(
     originalOnChunk: (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => Promise<void>,
     participants: Participant[],
@@ -1380,7 +2158,8 @@ export class InferenceService {
         }
         
         // Check if buffer starts with "ParticipantName: "
-        const namePattern = new RegExp(`^${responderName}:\\s*`);
+        const escapedName = responderName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const namePattern = new RegExp(`^${escapedName}:\\s*`);
         if (namePattern.test(buffer)) {
           // Strip the name prefix
           buffer = buffer.replace(namePattern, '');

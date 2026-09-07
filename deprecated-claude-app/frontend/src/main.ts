@@ -20,6 +20,7 @@ import ConversationView from './views/ConversationView.vue';
 import LoginView from './views/LoginView.vue';
 import AboutView from './views/AboutView.vue';
 import SharedView from './views/SharedView.vue';
+import InviteView from './views/InviteView.vue';
 import ModelTestView from './views/ModelTestView.vue';
 import ModelPricingView from './views/ModelPricingView.vue';
 import AdminView from './views/AdminView.vue';
@@ -27,6 +28,8 @@ import PersonasView from './views/PersonasView.vue';
 import VerifyEmailView from './views/VerifyEmailView.vue';
 import ResetPasswordView from './views/ResetPasswordView.vue';
 import ArchiveView from './views/ArchiveView.vue';
+import TermsView from './views/TermsView.vue';
+import PrivacyView from './views/PrivacyView.vue';
 
 const vuetify = createVuetify({
   components,
@@ -82,6 +85,16 @@ const router = createRouter({
       component: AboutView,
     },
     {
+      path: '/terms',
+      name: 'terms',
+      component: TermsView,
+    },
+    {
+      path: '/privacy',
+      name: 'privacy',
+      component: PrivacyView,
+    },
+    {
       path: '/model-test',
       name: 'model-test',
       component: ModelTestView,
@@ -92,6 +105,12 @@ const router = createRouter({
       name: 'share',
       component: SharedView,
       // No auth required - public route
+    },
+    {
+      path: '/invite/:token',
+      name: 'invite',
+      component: InviteView,
+      // No auth required - handles both logged in and out
     },
     {
       path: '/models',
@@ -117,6 +136,12 @@ const router = createRouter({
     {
       path: '/conversation/:id?',
       name: 'conversation',
+      component: ConversationView,
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/conversation/:conversationId/message/:messageId',
+      name: 'message-link',
       component: ConversationView,
       meta: { requiresAuth: true },
     },

@@ -2,14 +2,20 @@ import { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } from '@aws
 import { Message, getActiveBranch, ModelSettings } from '@deprecated-claude/shared';
 import { Database } from '../database/index.js';
 import { llmLogger } from '../utils/llmLogger.js';
+import sharp from 'sharp';
+import { isImageFile } from './attachment-utils.js';
+
+// Image size limit - Anthropic/Bedrock limit is 5MB, we target 4MB to have margin
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
 export class BedrockService {
   private client: BedrockRuntimeClient;
+  private apacClient: BedrockRuntimeClient;
   private db: Database;
 
   constructor(db: Database, credentials?: import('@deprecated-claude/shared').BedrockCredentials) {
     this.db = db;
-    
+
     // Initialize Bedrock client with user credentials or environment variables
     if (credentials) {
       this.client = new BedrockRuntimeClient({
@@ -33,6 +39,31 @@ export class BedrockService {
         })
       });
     }
+
+    // APAC client for apac.anthropic.* cross-region inference
+    const apacCreds = credentials ? {
+      accessKeyId: credentials.accessKeyId,
+      secretAccessKey: credentials.secretAccessKey,
+    } : (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY ? {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    } : undefined);
+    this.apacClient = new BedrockRuntimeClient({
+      region: 'ap-southeast-1',
+      ...(apacCreds && { credentials: apacCreds })
+    });
+  }
+
+  private getClientForModel(modelId: string): BedrockRuntimeClient {
+    return modelId.startsWith('apac.') ? this.apacClient : this.client;
+  }
+
+  // Claude 2 / Claude Instant are the only Bedrock Claude models still on the
+  // legacy text-completions shape (prompt / max_tokens_to_sample). Claude 3.x,
+  // 4.x and later — including regional inference profiles (us./eu./apac.
+  // prefixes) — all use the Messages API shape.
+  private usesMessagesApi(modelId: string): boolean {
+    return !/claude-(v2|instant)/.test(modelId);
   }
 
   async streamCompletion(
@@ -40,7 +71,7 @@ export class BedrockService {
     messages: Message[],
     systemPrompt: string | undefined,
     settings: ModelSettings,
-    onChunk: (chunk: string, isComplete: boolean) => Promise<void>,
+    onChunk: (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => Promise<void>,
     stopSequences?: string[]
   ): Promise<{ rawRequest?: any }> {
     // Demo mode - simulate streaming response
@@ -54,8 +85,8 @@ export class BedrockService {
     let bedrockModelId: string | undefined;
 
     try {
-      // Convert messages to Claude format
-      const claudeMessages = this.formatMessagesForClaude(messages);
+      // Convert messages to Claude format (async due to image resizing)
+      const claudeMessages = await this.formatMessagesForClaude(messages);
       
       // Build the request body based on model version
       const requestBody = this.buildRequestBody(modelId, claudeMessages, systemPrompt, settings, stopSequences);
@@ -94,7 +125,8 @@ export class BedrockService {
         accept: 'application/json'
       });
 
-      const response = await this.client.send(command);
+      const targetClient = this.getClientForModel(bedrockModelId);
+      const response = await targetClient.send(command);
       
       if (!response.body) {
         throw new Error('No response body from Bedrock');
@@ -102,23 +134,131 @@ export class BedrockService {
 
       let fullContent = '';
 
+      // Usage tracking — mirrors anthropic.ts. Claude-on-Bedrock returns the
+      // same Anthropic-style event types (`message_start`, `message_delta`,
+      // `message_stop`), each carrying a `usage` block. We also opportunistically
+      // read Bedrock's own `amazon-bedrock-invocationMetrics` chunk (present at
+      // stream end on InvokeModelWithResponseStream) as a fallback / sanity check.
+      //
+      // CRITICAL: input_tokens is canonically on `message_start.message.usage`.
+      // We must capture it there because `message_delta.usage` typically only
+      // carries output_tokens; a wholesale replace would zero out fresh input.
+      // Same bug pattern that was fixed in anthropic.ts.
+      let usage: any = {};
+      const cacheMetrics = {
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+      };
+
+      // Content-block tracking (Messages API models). Mirrors anthropic.ts so
+      // extended-thinking blocks stream and persist the same way on both legs.
+      const useMessages = this.usesMessagesApi(bedrockModelId);
+      const contentBlocks: any[] = [];
+      let currentBlockIndex = -1;
+      let currentBlock: any = null;
+
       for await (const chunk of response.body) {
         if (chunk.chunk?.bytes) {
           const chunkData = JSON.parse(new TextDecoder().decode(chunk.chunk.bytes));
-          
+
+          // Capture cache + fresh input tokens from message_start (Claude 3+).
+          if (chunkData.type === 'message_start' && chunkData.message?.usage) {
+            const m = chunkData.message.usage;
+            cacheMetrics.cacheCreationInputTokens = m.cache_creation_input_tokens || 0;
+            cacheMetrics.cacheReadInputTokens = m.cache_read_input_tokens || 0;
+            if (typeof m.input_tokens === 'number') usage.input_tokens = m.input_tokens;
+            if (typeof m.output_tokens === 'number') usage.output_tokens = m.output_tokens;
+          }
+
+          // Merge (don't replace) message_delta usage so input_tokens captured
+          // from message_start survives.
+          if (chunkData.type === 'message_delta' && chunkData.usage) {
+            usage = { ...usage, ...chunkData.usage };
+          }
+
+          // Bedrock-specific invocation metrics chunk. Carries `inputTokenCount`
+          // and `outputTokenCount` directly from Bedrock's metering. Used as a
+          // fallback only — the Anthropic-style events are more granular (split
+          // cache vs fresh) so we keep those when present.
+          if (chunkData['amazon-bedrock-invocationMetrics']) {
+            const metrics = chunkData['amazon-bedrock-invocationMetrics'];
+            if (usage.input_tokens === undefined && typeof metrics.inputTokenCount === 'number') {
+              usage.input_tokens = metrics.inputTokenCount;
+            }
+            if (usage.output_tokens === undefined && typeof metrics.outputTokenCount === 'number') {
+              usage.output_tokens = metrics.outputTokenCount;
+            }
+          }
+
           // Handle different response formats based on model
-          const content = this.extractContentFromChunk(modelId, chunkData);
-          
-          if (content) {
-            fullContent += content;
-            chunks.push(content);
-            await onChunk(content, false);
+          if (useMessages) {
+            // Messages API: track content blocks (text / thinking /
+            // redacted_thinking) the same way anthropic.ts does.
+            if (chunkData.type === 'content_block_start') {
+              currentBlockIndex = chunkData.index;
+              currentBlock = { ...chunkData.content_block };
+              if (currentBlock.type === 'thinking') {
+                currentBlock.thinking = currentBlock.thinking || '';
+              } else if (currentBlock.type === 'redacted_thinking') {
+                // redacted_thinking arrives complete in content_block_start —
+                // keep `data` intact or the round-trip block becomes invalid.
+                currentBlock.data = chunkData.content_block.data ?? '';
+              } else if (currentBlock.type === 'text') {
+                currentBlock.text = currentBlock.text || '';
+              }
+              contentBlocks[currentBlockIndex] = currentBlock;
+            } else if (chunkData.type === 'content_block_delta') {
+              const delta = chunkData.delta;
+              if (delta?.type === 'thinking_delta' && currentBlock?.type === 'thinking') {
+                currentBlock.thinking += delta.thinking;
+                contentBlocks[currentBlockIndex] = currentBlock;
+                await onChunk('', false, contentBlocks);
+              } else if (delta?.type === 'signature_delta' && currentBlock?.type === 'thinking') {
+                currentBlock.signature = (currentBlock.signature || '') + delta.signature;
+                contentBlocks[currentBlockIndex] = currentBlock;
+              } else if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+                if (currentBlock?.type === 'text') {
+                  currentBlock.text += delta.text;
+                  contentBlocks[currentBlockIndex] = currentBlock;
+                }
+                fullContent += delta.text;
+                chunks.push(delta.text);
+                await onChunk(delta.text, false, contentBlocks.length > 0 ? contentBlocks : undefined);
+              }
+            } else if (chunkData.type === 'content_block_stop') {
+              currentBlock = null;
+            }
+          } else {
+            const content = this.extractContentFromChunk(modelId, chunkData);
+
+            if (content) {
+              fullContent += content;
+              chunks.push(content);
+              await onChunk(content, false);
+            }
           }
 
           // Check if stream is complete
           if (this.isStreamComplete(modelId, chunkData)) {
-            await onChunk('', true);
-            
+            // Build actualUsage matching the shape Anthropic/OpenRouter emit.
+            // For Claude 2 / Instant (older Bedrock models) the Anthropic-style
+            // events don't exist; we still pass through whatever fell out of
+            // amazon-bedrock-invocationMetrics, else nothing — the enhanced
+            // inference layer will fall back to its chars/4 estimate.
+            const actualUsage = (usage.input_tokens !== undefined || usage.output_tokens !== undefined)
+              ? {
+                  inputTokens: usage.input_tokens || 0,
+                  outputTokens: usage.output_tokens || 0,
+                  cacheCreationInputTokens: cacheMetrics.cacheCreationInputTokens,
+                  cacheReadInputTokens: cacheMetrics.cacheReadInputTokens,
+                  // Bedrock InvokeModel only offers the 5m cache tier (the ttl
+                  // field is rejected outright), so bill writes at 1.25×.
+                  cacheCreationTtl: '5m' as const,
+                }
+              : undefined;
+
+            await onChunk('', true, contentBlocks.length > 0 ? contentBlocks : undefined, actualUsage);
+
             // Log the response
             const duration = Date.now() - startTime;
             await llmLogger.logResponse({
@@ -126,13 +266,14 @@ export class BedrockService {
               service: 'bedrock',
               model: bedrockModelId || modelId,
               chunks,
-              duration
+              duration,
+              tokenCount: (usage.input_tokens || 0) + (usage.output_tokens || 0),
             });
             break;
           }
         }
       }
-      
+
       return { rawRequest };
     } catch (error) {
       console.error('Bedrock streaming error:', error);
@@ -152,21 +293,80 @@ export class BedrockService {
     }
   }
 
-  formatMessagesForClaude(messages: Message[]): Array<{ role: string; content: string }> {
-    const formattedMessages: Array<{ role: string; content: string }> = [];
+  async formatMessagesForClaude(messages: Message[]): Promise<Array<{ role: string; content: string | any[] }>> {
+    const formattedMessages: Array<{ role: string; content: string | any[] }> = [];
 
     for (const message of messages) {
       const activeBranch = getActiveBranch(message);
       if (activeBranch && activeBranch.role !== 'system') {
-        let content = activeBranch.content;
+        let content: string | any[] = activeBranch.content;
         
-        // Append attachments to user messages
+        // Handle attachments for user messages - need to use content blocks for images
         if (activeBranch.role === 'user' && activeBranch.attachments && activeBranch.attachments.length > 0) {
+          const contentParts: any[] = [{ type: 'text', text: activeBranch.content }];
+          
+          console.log(`[Bedrock] Processing ${activeBranch.attachments.length} attachments for user message`);
           for (const attachment of activeBranch.attachments) {
-            content += `\n\n<attachment filename="${attachment.fileName}">\n${attachment.content}\n</attachment>`;
+            const isImage = this.isImageAttachment(attachment.fileName);
+            const isPdf = this.isPdfAttachment(attachment.fileName);
+            const mediaType = this.getMediaType(attachment.fileName, (attachment as any).mimeType);
+            
+            if (isImage) {
+              // Resize image if needed (Anthropic/Bedrock has 5MB limit)
+              const resizedContent = await this.resizeImageIfNeeded(attachment.content, attachment.fileName);
+              // After resize, always use JPEG media type since we convert during resize
+              const resizedMediaType = resizedContent !== attachment.content ? 'image/jpeg' : mediaType;
+              
+              // Add image as a separate content block for Claude 3 API
+              contentParts.push({
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: resizedMediaType,
+                  data: resizedContent
+                }
+              });
+              console.log(`[Bedrock] Added image attachment: ${attachment.fileName} (${resizedMediaType})`);
+            } else if (isPdf) {
+              // Add PDF as a document content block for Claude API
+              contentParts.push({
+                type: 'document',
+                source: {
+                  type: 'base64',
+                  media_type: 'application/pdf',
+                  data: attachment.content
+                }
+              });
+              console.log(`[Bedrock] Added PDF attachment: ${attachment.fileName}`);
+            } else {
+              // Append text attachments to the text content
+              contentParts[0].text += `\n\n<attachment filename="${attachment.fileName}">\n${attachment.content}\n</attachment>`;
+              console.log(`[Bedrock] Added text attachment: ${attachment.fileName} (${attachment.content.length} chars)`);
+            }
           }
+          
+          content = contentParts;
         }
         
+        // Apply prompt-cache breakpoints set upstream (enhanced-inference).
+        // Bedrock InvokeModel rejects the `ttl` field (5m tier only, verified
+        // live 2026-08-06), so send bare ephemeral cache_control regardless of
+        // the marker's requested ttl.
+        if ((activeBranch as any)._hasCacheBreakpoints && typeof content === 'string' && content.includes('<|cache_breakpoint|>')) {
+          // Prefill mode: split at Chapter II markers into cached text blocks
+          content = this.splitAtCacheBreakpoints(content);
+        } else if ((activeBranch as any)._cacheControl) {
+          const cacheControl = { type: 'ephemeral' };
+          if (typeof content === 'string') {
+            if (content.length > 0) {
+              content = [{ type: 'text', text: content, cache_control: cacheControl }];
+            }
+          } else if (Array.isArray(content) && content.length > 0) {
+            const last = content[content.length - 1];
+            content[content.length - 1] = { ...last, cache_control: cacheControl };
+          }
+        }
+
         // Claude expects 'user' and 'assistant' roles only
         formattedMessages.push({
           role: activeBranch.role,
@@ -178,31 +378,159 @@ export class BedrockService {
     return formattedMessages;
   }
 
+  /**
+   * Split content at <|cache_breakpoint|> markers and convert to text blocks.
+   * Each section BEFORE a marker gets cache_control, the last section does not.
+   * Same as anthropic.ts's splitAtCacheBreakpoints, minus the ttl field —
+   * Bedrock InvokeModel rejects it (5m tier only).
+   */
+  private splitAtCacheBreakpoints(content: string): Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }> {
+    const CACHE_BREAKPOINT = '<|cache_breakpoint|>';
+    const sections = content.split(CACHE_BREAKPOINT);
+
+    console.log(`[Bedrock] 📦 Splitting prefill content at ${sections.length - 1} cache breakpoints`);
+
+    const contentBlocks: Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }> = [];
+
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i].trim();
+      if (!section) continue; // Skip empty sections
+
+      const isLastSection = i === sections.length - 1;
+
+      if (isLastSection) {
+        // Last section (after final marker) - NO cache control
+        contentBlocks.push({ type: 'text', text: section });
+      } else {
+        contentBlocks.push({
+          type: 'text',
+          text: section,
+          cache_control: { type: 'ephemeral' }
+        });
+      }
+    }
+
+    return contentBlocks;
+  }
+
+  private isImageAttachment(fileName: string): boolean {
+    return isImageFile(fileName);
+  }
+  
+  private isPdfAttachment(fileName: string): boolean {
+    const extension = fileName.split('.').pop()?.toLowerCase() || '';
+    return extension === 'pdf';
+  }
+  
+  private getMediaType(fileName: string, mimeType?: string): string {
+    // Use provided mimeType if available
+    if (mimeType) return mimeType;
+    
+    const extension = fileName.split('.').pop()?.toLowerCase() || '';
+    const mediaTypes: { [key: string]: string } = {
+      // Images
+      'jpg': 'image/jpeg',
+      'jpeg': 'image/jpeg',
+      'png': 'image/png',
+      'gif': 'image/gif',
+      'webp': 'image/webp',
+      // Documents
+      'pdf': 'application/pdf',
+    };
+    return mediaTypes[extension] || 'application/octet-stream';
+  }
+  
+  /**
+   * Resize an image if it exceeds the max size limit (4MB to stay under Anthropic/Bedrock's 5MB limit)
+   * Returns the resized base64 string, or the original if already small enough
+   */
+  private async resizeImageIfNeeded(base64Data: string, fileName: string): Promise<string> {
+    // Calculate size of base64 data (base64 is ~4/3 of binary size)
+    const estimatedBytes = Math.ceil(base64Data.length * 0.75);
+    
+    if (estimatedBytes <= MAX_IMAGE_BYTES) {
+      return base64Data; // Already small enough
+    }
+    
+    console.log(`[Bedrock] Image ${fileName} is ${(estimatedBytes / 1024 / 1024).toFixed(2)}MB, resizing...`);
+    
+    try {
+      // Decode base64 to buffer
+      const inputBuffer = Buffer.from(base64Data, 'base64');
+      
+      // Get image metadata to calculate resize ratio
+      const metadata = await sharp(inputBuffer).metadata();
+      if (!metadata.width || !metadata.height) {
+        console.warn(`[Bedrock] Could not get image dimensions for ${fileName}, using original`);
+        return base64Data;
+      }
+      
+      // Calculate how much we need to shrink (target 80% of max to have margin)
+      const targetBytes = MAX_IMAGE_BYTES * 0.8;
+      const shrinkRatio = Math.sqrt(targetBytes / estimatedBytes);
+      const newWidth = Math.floor(metadata.width * shrinkRatio);
+      const newHeight = Math.floor(metadata.height * shrinkRatio);
+      
+      console.log(`[Bedrock] Resizing from ${metadata.width}x${metadata.height} to ${newWidth}x${newHeight}`);
+      
+      // Resize and convert to JPEG for better compression
+      const resizedBuffer = await sharp(inputBuffer)
+        .resize(newWidth, newHeight, { fit: 'inside' })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      const resizedBase64 = resizedBuffer.toString('base64');
+      const newSize = Math.ceil(resizedBase64.length * 0.75);
+      
+      console.log(`[Bedrock] Resized ${fileName}: ${(estimatedBytes / 1024 / 1024).toFixed(2)}MB -> ${(newSize / 1024 / 1024).toFixed(2)}MB`);
+      
+      return resizedBase64;
+    } catch (error) {
+      console.error(`[Bedrock] Failed to resize image ${fileName}:`, error);
+      return base64Data; // Return original on error
+    }
+  }
+
   private buildRequestBody(
     modelId: string,
-    messages: Array<{ role: string; content: string }>,
+    messages: Array<{ role: string; content: string | any[] }>,
     systemPrompt: string | undefined,
     settings: ModelSettings,
     stopSequences?: string[]
   ): any {
-    // Claude 3 models use Messages API format
-    // Check if it's a Claude 3 model by looking for the pattern in the Bedrock model ID
-    if (modelId.includes('claude-3')) {
+    // Claude 3+ models (including 4.x and regional inference profiles) use the
+    // Messages API format with content blocks
+    if (this.usesMessagesApi(modelId)) {
+      // Extended thinking: Bedrock InvokeModel only supports the legacy
+      // enabled/budget_tokens shape (adaptive-thinking models aren't served on
+      // this leg). Mirrors anthropic.ts: max_tokens must exceed budget_tokens.
+      let effectiveMaxTokens = settings.maxTokens;
+      let thinkingConfig: any = undefined;
+      if (settings.thinking?.enabled && settings.thinking.budgetTokens) {
+        const minMaxTokens = settings.thinking.budgetTokens + 4096;
+        if (effectiveMaxTokens < minMaxTokens) {
+          console.log(`[Bedrock] Adjusting max_tokens from ${effectiveMaxTokens} to ${minMaxTokens} (budget_tokens: ${settings.thinking.budgetTokens})`);
+          effectiveMaxTokens = minMaxTokens;
+        }
+        thinkingConfig = { type: 'enabled', budget_tokens: settings.thinking.budgetTokens };
+      }
+
       // Anthropic API doesn't allow both temperature AND top_p/top_k together
       const useTemperature = settings.temperature !== undefined;
       return {
         anthropic_version: 'bedrock-2023-05-31',
         messages,
         ...(systemPrompt && { system: systemPrompt }),
-        max_tokens: settings.maxTokens,
+        max_tokens: effectiveMaxTokens,
         temperature: settings.temperature,
         ...(!useTemperature && settings.topP !== undefined && { top_p: settings.topP }),
         ...(!useTemperature && settings.topK !== undefined && { top_k: settings.topK }),
-        ...(stopSequences && stopSequences.length > 0 && { stop_sequences: stopSequences })
+        ...(stopSequences && stopSequences.length > 0 && { stop_sequences: stopSequences }),
+        ...(thinkingConfig && { thinking: thinkingConfig })
       };
     }
     
-    // Claude 2 and Instant use older format
+    // Claude 2 and Instant use older format - convert content blocks to text
     let prompt = '';
     
     if (systemPrompt) {
@@ -210,10 +538,30 @@ export class BedrockService {
     }
 
     for (const msg of messages) {
+      // Extract text content from content blocks or use string content directly
+      let textContent: string;
+      if (typeof msg.content === 'string') {
+        textContent = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        // For Claude 2, we can only use text content - images are not supported
+        textContent = msg.content
+          .filter(block => block.type === 'text')
+          .map(block => block.text)
+          .join('\n');
+        
+        // Warn about unsupported content types
+        const nonTextBlocks = msg.content.filter(block => block.type !== 'text');
+        if (nonTextBlocks.length > 0) {
+          console.warn(`[Bedrock] Claude 2/Instant does not support ${nonTextBlocks.length} non-text content blocks (images, PDFs). These will be ignored.`);
+        }
+      } else {
+        textContent = String(msg.content);
+      }
+      
       if (msg.role === 'user') {
-        prompt += `\n\nHuman: ${msg.content}`;
+        prompt += `\n\nHuman: ${textContent}`;
       } else if (msg.role === 'assistant') {
-        prompt += `\n\nAssistant: ${msg.content}`;
+        prompt += `\n\nAssistant: ${textContent}`;
       }
     }
     
@@ -234,8 +582,7 @@ export class BedrockService {
 
 
   private extractContentFromChunk(modelId: string, chunkData: any): string | null {
-    // Claude 3 models - check if the Bedrock model ID contains 'claude-3'
-    if (modelId.includes('claude-3')) {
+    if (this.usesMessagesApi(modelId)) {
       if (chunkData.type === 'content_block_delta' && chunkData.delta?.text) {
         return chunkData.delta.text;
       }
@@ -245,13 +592,12 @@ export class BedrockService {
         return chunkData.completion;
       }
     }
-    
+
     return null;
   }
 
   private isStreamComplete(modelId: string, chunkData: any): boolean {
-    // Claude 3 models - check if the Bedrock model ID contains 'claude-3'
-    if (modelId.includes('claude-3')) {
+    if (this.usesMessagesApi(modelId)) {
       return chunkData.type === 'message_stop';
     } else {
       // Claude 2 and Instant
