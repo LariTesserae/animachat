@@ -463,7 +463,29 @@ export function adminRouter(db: Database): Router {
         });
       }
       out.sort((a, b) => (b.firstSeen || '').localeCompare(a.firstSeen || ''));
-      res.json({ source: CENSUS_URL, generatedAt: census.generated_at, minds: out });
+
+      // Served legs the census cannot see any more: door gone from its catalog,
+      // or probed dead. Never deleted (conversation participants reference
+      // these ids) — the admin can hide them.
+      const doorIndex = new Map<string, any>();
+      for (const m of Object.values<any>(census.models || {})) {
+        for (const d of m.doors || []) {
+          const provider = CENSUS_SOURCE_TO_PROVIDER[d.source];
+          if (provider) doorIndex.set(`${provider}|${stripRegion(d.id).toLowerCase()}`, d);
+        }
+      }
+      const stale: any[] = [];
+      for (const m of have) {
+        if (!['anthropic', 'openrouter', 'bedrock'].includes(m.provider)) continue;
+        const d = doorIndex.get(`${m.provider}|${stripRegion(m.providerModelId).toLowerCase()}`);
+        let why: string | null = null;
+        if (!d) why = 'door never seen by the census (scans since 2026-06-24)';
+        else if (!d.listed_now) why = `not listed now (last seen ${(d.last_seen || '').slice(0, 10)})`;
+        else if ((d.ping || {}).state === 'dead') why = 'listed but probe hard-fails';
+        if (why) stale.push({ id: m.id, provider: m.provider, providerModelId: m.providerModelId,
+                              displayName: m.displayName, hidden: m.hidden, why });
+      }
+      res.json({ source: CENSUS_URL, generatedAt: census.generated_at, minds: out, stale });
     } catch (error) {
       console.error('Error reading census:', error);
       res.status(502).json({ error: `Census beacon unavailable: ${(error as Error).message}` });
@@ -529,6 +551,18 @@ export function adminRouter(db: Database): Router {
       res.json({ added, skipped: entries.map(e => e.id).filter(i => !added.includes(i)) });
     } catch (error) {
       console.error('Error importing census models:', error);
+      res.status(400).json({ error: (error as Error).message });
+    }
+  });
+
+  // POST /admin/models/local/override - per-model override kept in the overlay
+  // (survives deploys, unlike PATCH /models/:id/visibility which edits models.json)
+  router.post('/models/local/override', async (req: AuthRequest, res) => {
+    try {
+      const { id, hidden } = z.object({ id: z.string(), hidden: z.boolean() }).parse(req.body);
+      await ModelLoader.getInstance().setLocalOverride(id, { hidden });
+      res.json({ success: true, id, hidden });
+    } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }
   });

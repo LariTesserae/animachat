@@ -67,6 +67,28 @@
         </tbody>
       </v-table>
       <div v-if="!filtered.length && !loading" class="text-grey text-center py-6">Nothing matches.</div>
+
+      <template v-if="stale.length">
+        <v-divider class="my-6" />
+        <div class="d-flex align-center mb-2">
+          <v-icon class="mr-2" color="warning">mdi-door-closed</v-icon>
+          <span class="text-subtitle-1">Served models whose door the census cannot see ({{ stale.length }})</span>
+        </div>
+        <p class="text-caption text-grey mb-3">
+          Never deleted — participants in existing conversations are identified by these ids. Hide them from the selector instead; the switch is kept in models.local.json and survives deploys.
+        </p>
+        <v-table density="compact">
+          <thead><tr><th>Model</th><th>Door</th><th>Why</th><th>Hidden</th></tr></thead>
+          <tbody>
+            <tr v-for="s in stale" :key="s.id">
+              <td>{{ s.displayName }} <span class="text-caption text-grey">{{ s.id }}</span></td>
+              <td class="text-caption">{{ s.provider }} · {{ s.providerModelId }}</td>
+              <td class="text-caption">{{ s.why }}</td>
+              <td><v-switch :model-value="s.hidden" density="compact" hide-details color="warning" @update:model-value="setHidden(s, $event)" /></td>
+            </tr>
+          </tbody>
+        </v-table>
+      </template>
     </v-card-text>
   </v-card>
 </template>
@@ -78,7 +100,9 @@ import { api } from '../services/api';
 interface Leg { provider: string; providerModelId: string; state: string | null; existingId: string | null; maxOut: number | null; }
 interface Mind { mindId: string; display: string; role: string | null; io: { in: string[]; out: string[] } | null; firstSeen: string | null; legs: Leg[]; allExisting: boolean; }
 
+interface Stale { id: string; provider: string; providerModelId: string; displayName: string; hidden: boolean; why: string; }
 const rows = ref<Mind[]>([]);
+const stale = ref<Stale[]>([]);
 const generatedAt = ref<string>('');
 const localCount = ref(0);
 const loading = ref(false);
@@ -120,7 +144,7 @@ async function load() {
   loading.value = true; error.value = '';
   try {
     const [c, l] = await Promise.all([api.get('/admin/census'), api.get('/admin/models/local')]);
-    rows.value = c.data.minds; generatedAt.value = c.data.generatedAt || ''; localCount.value = (l.data.models || []).length;
+    rows.value = c.data.minds; stale.value = c.data.stale || []; generatedAt.value = c.data.generatedAt || ''; localCount.value = (l.data.models || []).length;
   } catch (e: any) {
     error.value = e?.response?.data?.error || e.message;
   } finally { loading.value = false; }
@@ -134,6 +158,14 @@ async function importSelected() {
   } catch (e: any) {
     error.value = e?.response?.data?.error || e.message;
   } finally { importing.value = false; }
+}
+async function setHidden(s: Stale, hidden: boolean | null) {
+  try {
+    await api.post('/admin/models/local/override', { id: s.id, hidden: !!hidden });
+    s.hidden = !!hidden;
+  } catch (e: any) {
+    error.value = e?.response?.data?.error || e.message;
+  }
 }
 onMounted(load);
 </script>

@@ -40,14 +40,37 @@ export class ModelLoader {
       this.modelConfigPath.replace(/models\.json$/, 'models.local.json');
   }
 
-  async loadLocalModels(): Promise<Model[]> {
+  private async readLocalFile(): Promise<{ models: Model[]; overrides: Record<string, Partial<Model>> }> {
     try {
       const data = await readFile(this.localModelsPath, 'utf-8');
       const parsed = JSON.parse(data);
-      return parsed.models || [];
+      return { models: parsed.models || [], overrides: parsed.overrides || {} };
     } catch {
-      return [];
+      return { models: [], overrides: {} };
     }
+  }
+
+  private async writeLocalFile(local: { models: Model[]; overrides: Record<string, Partial<Model>> }): Promise<void> {
+    const { writeFile } = await import('fs/promises');
+    await writeFile(this.localModelsPath, JSON.stringify(local, null, 2), 'utf-8');
+  }
+
+  async loadLocalModels(): Promise<Model[]> {
+    return (await this.readLocalFile()).models;
+  }
+
+  /** Per-model overrides (today: hidden) that survive a deploy. Models are
+   *  never removed from models.json: participants in existing conversations
+   *  are identified by model id. */
+  async loadLocalOverrides(): Promise<Record<string, Partial<Model>>> {
+    return (await this.readLocalFile()).overrides;
+  }
+
+  async setLocalOverride(id: string, patch: Partial<Model>): Promise<void> {
+    const local = await this.readLocalFile();
+    local.overrides[id] = { ...(local.overrides[id] || {}), ...patch };
+    await this.writeLocalFile(local);
+    await this.reloadModels();
   }
 
   async loadModels(): Promise<Model[]> {
@@ -59,9 +82,9 @@ export class ModelLoader {
       const modelsData = await readFile(this.modelConfigPath, 'utf-8');
       const parsed = JSON.parse(modelsData);
       const base: Model[] = parsed.models || [];
-      const local = await this.loadLocalModels();
+      const { models: local, overrides } = await this.readLocalFile();
       const seen = new Set(base.map(m => m.id));
-      const merged = [...base];
+      const merged = base.map(m => overrides[m.id] ? { ...m, ...overrides[m.id] } : m);
       for (const m of local) {
         if (seen.has(m.id)) {
           console.warn(`models.local.json: id ${m.id} already in models.json — overlay entry ignored`);
@@ -83,29 +106,29 @@ export class ModelLoader {
 
   /** Append models to the overlay file and reload. Returns the ids added. */
   async addLocalModels(entries: Model[]): Promise<string[]> {
-    const { writeFile } = await import('fs/promises');
     const existing = await this.loadModels();
     const ids = new Set(existing.map(m => m.id));
-    const local = await this.loadLocalModels();
+    const local = await this.readLocalFile();
     const added: string[] = [];
     for (const e of entries) {
       if (ids.has(e.id)) continue;
-      local.push(e);
+      local.models.push(e);
       ids.add(e.id);
       added.push(e.id);
     }
-    await writeFile(this.localModelsPath, JSON.stringify({ models: local }, null, 2), 'utf-8');
+    await this.writeLocalFile(local);
     await this.reloadModels();
     return added;
   }
 
-  /** Remove a model from the overlay file (models.json entries are not touched). */
+  /** Remove a model from the overlay file (models.json entries are never
+   *  removed — see loadLocalOverrides). */
   async removeLocalModel(id: string): Promise<boolean> {
-    const { writeFile } = await import('fs/promises');
-    const local = await this.loadLocalModels();
-    const next = local.filter(m => m.id !== id);
-    if (next.length === local.length) return false;
-    await writeFile(this.localModelsPath, JSON.stringify({ models: next }, null, 2), 'utf-8');
+    const local = await this.readLocalFile();
+    const next = local.models.filter(m => m.id !== id);
+    if (next.length === local.models.length) return false;
+    local.models = next;
+    await this.writeLocalFile(local);
     await this.reloadModels();
     return true;
   }
