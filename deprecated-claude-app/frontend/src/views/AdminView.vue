@@ -69,6 +69,9 @@
     <!-- Config Editor -->
     <ConfigEditor class="mb-6" />
 
+    <!-- Models from the census beacon -->
+    <CensusModelsPanel />
+
     <!-- Legacy Migration Tools -->
     <v-card class="mb-6" variant="outlined" color="warning">
       <v-card-title class="text-subtitle-1">
@@ -392,6 +395,7 @@ import { ref, computed, onMounted } from 'vue';
 import { api } from '@/services/api';
 import UsageChart from '@/components/UsageChart.vue';
 import ConfigEditor from '@/components/ConfigEditor.vue';
+import CensusModelsPanel from '../components/CensusModelsPanel.vue';
 
 // Get API base URL from the api instance
 const apiBaseUrl = (api.defaults.baseURL || '/api').replace(/\/$/, '');

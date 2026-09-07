@@ -34,3 +34,4 @@ backend/config/siteConfig.production.json
 scratch-*.md
 scratch-*.txt
 .notes/
+backend/config/models.local.json

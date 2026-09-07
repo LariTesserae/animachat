@@ -30,6 +30,26 @@ export class ModelLoader {
     this.db = db;
   }
 
+  /**
+   * Overlay file for models added at runtime (admin "Census" panel).
+   * Kept beside models.json but NOT shipped by CI, so additions made on the
+   * server survive a deploy that overwrites models.json from the repo.
+   */
+  get localModelsPath(): string {
+    return process.env.MODELS_LOCAL_CONFIG_PATH ||
+      this.modelConfigPath.replace(/models\.json$/, 'models.local.json');
+  }
+
+  async loadLocalModels(): Promise<Model[]> {
+    try {
+      const data = await readFile(this.localModelsPath, 'utf-8');
+      const parsed = JSON.parse(data);
+      return parsed.models || [];
+    } catch {
+      return [];
+    }
+  }
+
   async loadModels(): Promise<Model[]> {
     if (this.models) {
       return this.models;
@@ -38,14 +58,56 @@ export class ModelLoader {
     try {
       const modelsData = await readFile(this.modelConfigPath, 'utf-8');
       const parsed = JSON.parse(modelsData);
-      this.models = parsed.models || [];
-      console.log(`Loaded ${this.models?.length || 0} models from ${this.modelConfigPath}`);
+      const base: Model[] = parsed.models || [];
+      const local = await this.loadLocalModels();
+      const seen = new Set(base.map(m => m.id));
+      const merged = [...base];
+      for (const m of local) {
+        if (seen.has(m.id)) {
+          console.warn(`models.local.json: id ${m.id} already in models.json — overlay entry ignored`);
+          continue;
+        }
+        seen.add(m.id);
+        merged.push(m);
+      }
+      this.models = merged;
+      console.log(`Loaded ${base.length} models from ${this.modelConfigPath}` +
+        (local.length ? ` + ${local.length} local from ${this.localModelsPath}` : ''));
       return this.models || [];
     } catch (error) {
       console.error(`Failed to load models from ${this.modelConfigPath}:`, error);
       // Return empty array as fallback
       return [];
     }
+  }
+
+  /** Append models to the overlay file and reload. Returns the ids added. */
+  async addLocalModels(entries: Model[]): Promise<string[]> {
+    const { writeFile } = await import('fs/promises');
+    const existing = await this.loadModels();
+    const ids = new Set(existing.map(m => m.id));
+    const local = await this.loadLocalModels();
+    const added: string[] = [];
+    for (const e of entries) {
+      if (ids.has(e.id)) continue;
+      local.push(e);
+      ids.add(e.id);
+      added.push(e.id);
+    }
+    await writeFile(this.localModelsPath, JSON.stringify({ models: local }, null, 2), 'utf-8');
+    await this.reloadModels();
+    return added;
+  }
+
+  /** Remove a model from the overlay file (models.json entries are not touched). */
+  async removeLocalModel(id: string): Promise<boolean> {
+    const { writeFile } = await import('fs/promises');
+    const local = await this.loadLocalModels();
+    const next = local.filter(m => m.id !== id);
+    if (next.length === local.length) return false;
+    await writeFile(this.localModelsPath, JSON.stringify({ models: next }, null, 2), 'utf-8');
+    await this.reloadModels();
+    return true;
   }
 
   /**
